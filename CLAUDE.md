@@ -35,7 +35,8 @@ Sync triggers: 60-second timer, `EKEventStoreChanged` (debounced 3s), manual "Sy
 
 The data backend is the sibling project [`my-reminders`](../my-reminders) — a Next.js 16 app with Neon Postgres via Prisma, deployed on Vercel. It serves both a web UI and a CalDAV endpoint for Apple Reminders native sync.
 
-This sync app pushes data to the server's REST API (default `http://localhost:4001`):
+This sync app pushes data to the server's REST API (default `http://localhost:4001`). Every request must include `Authorization: Bearer <token>` where the token is the server's `MAC_SYNC_API_TOKEN` — configured in the menu bar UI ("API Token" field) and persisted in `UserDefaults` under the `apiToken` key. `APIClient.init(baseURL:apiToken:)` takes the token; `authorizedRequest(url:)` attaches the header to every outbound request. A missing or wrong token returns 401 from the server.
+
 - `GET /api/tasks` — list all non-deleted tasks
 - `GET /api/tasks?updatedSince=<ISO>` — incremental pull; includes soft-deleted items marked `{ deleted: true }` so this app can propagate server-side deletions into its local mapping store
 - `POST /api/tasks` — create `{ title, dueDate?, listName?, listColor?, notes?, url?, priority?, completedAt? }`

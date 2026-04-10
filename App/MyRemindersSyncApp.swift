@@ -55,6 +55,10 @@ struct MenuBarView: View {
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 250)
 
+            SecureField("API Token", text: $appState.apiToken)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 250)
+
             Divider()
 
             Button("Quit") {
@@ -83,6 +87,12 @@ class AppState: ObservableObject {
             recreateEngine()
         }
     }
+    @Published var apiToken: String = UserDefaults.standard.string(forKey: "apiToken") ?? "" {
+        didSet {
+            UserDefaults.standard.set(apiToken, forKey: "apiToken")
+            recreateEngine()
+        }
+    }
 
     private var syncEngine: SyncEngine!
     private var timer: Timer?
@@ -97,7 +107,10 @@ class AppState: ObservableObject {
 
     private func recreateEngine() {
         print("[AppState] Creating engine with URL: \(serverURL)")
-        let api = APIClient(baseURL: URL(string: serverURL) ?? URL(string: "http://localhost:4001")!)
+        let api = APIClient(
+            baseURL: URL(string: serverURL) ?? URL(string: "http://localhost:4001")!,
+            apiToken: apiToken.isEmpty ? nil : apiToken
+        )
         let reminders = AppleRemindersService()
         let mappingStore = MappingStore()
         syncEngine = SyncEngine(api: api, reminders: reminders, mappingStore: mappingStore)

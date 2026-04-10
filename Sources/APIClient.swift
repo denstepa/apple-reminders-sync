@@ -2,9 +2,21 @@ import Foundation
 
 public actor APIClient: APIClientProtocol {
     let baseURL: URL
+    let apiToken: String?
 
-    public init(baseURL: URL = URL(string: "http://localhost:4001")!) {
+    public init(baseURL: URL = URL(string: "http://localhost:4001")!, apiToken: String? = nil) {
         self.baseURL = baseURL
+        self.apiToken = apiToken
+    }
+
+    /// Build a URLRequest with the Authorization header attached when a token is configured.
+    /// The server requires `Authorization: Bearer <MAC_SYNC_API_TOKEN>` on every /api/tasks/* call.
+    private func authorizedRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let apiToken, !apiToken.isEmpty {
+            request.setValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
     public func fetchAllTasks(updatedSince: Date? = nil) async throws -> [ServerTask] {
@@ -12,7 +24,8 @@ public actor APIClient: APIClientProtocol {
         if let updatedSince {
             components.queryItems = [URLQueryItem(name: "updatedSince", value: ISO8601DateFormatter().string(from: updatedSince))]
         }
-        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        let request = authorizedRequest(url: components.url!)
+        let (data, response) = try await URLSession.shared.data(for: request)
         try validateResponse(response)
         return try JSONDecoder().decode([ServerTask].self, from: data)
     }
@@ -28,7 +41,7 @@ public actor APIClient: APIClientProtocol {
         completedAt: Date? = nil
     ) async throws -> ServerTask {
         let url_ = baseURL.appendingPathComponent("api/tasks")
-        var request = URLRequest(url: url_)
+        var request = authorizedRequest(url: url_)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -60,7 +73,7 @@ public actor APIClient: APIClientProtocol {
         priority: Int? = nil
     ) async throws -> ServerTask {
         let url_ = baseURL.appendingPathComponent("api/tasks/\(id)")
-        var request = URLRequest(url: url_)
+        var request = authorizedRequest(url: url_)
         request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -81,7 +94,7 @@ public actor APIClient: APIClientProtocol {
 
     public func deleteTask(id: String) async throws {
         let url = baseURL.appendingPathComponent("api/tasks/\(id)")
-        var request = URLRequest(url: url)
+        var request = authorizedRequest(url: url)
         request.httpMethod = "DELETE"
 
         let (_, response) = try await URLSession.shared.data(for: request)
