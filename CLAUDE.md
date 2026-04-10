@@ -6,14 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `swift build` — build the project
 - `swift run` — build and run the menu bar app
+- `swift test` — run the unit tests in `Tests/SyncTests`
 
 No external dependencies — only system frameworks (EventKit, SwiftUI, ServiceManagement).
 
 ## Architecture
 
-macOS 14+ menu bar app (SwiftUI) that does **one-way sync: Apple Reminders → Server**. Built with Swift Package Manager (swift-tools-version 5.9), single executable target.
+macOS 14+ menu bar app (SwiftUI) that does **one-way sync: Apple Reminders → Server**. Built with Swift Package Manager (swift-tools-version 5.9).
 
-All core services are **actors** for thread safety: `SyncEngine`, `AppleRemindersService`, `APIClient`, `MappingStore`.
+The package is split into three targets (see `Package.swift`):
+
+- **`SyncLib`** (`Sources/`) — library target holding all sync logic, API client, EventKit wrapper, mapping store, and models. Kept separate so it can be unit-tested without launching the app.
+- **`MyRemindersSync`** (`App/`) — thin executable target containing only `MyRemindersSyncApp.swift` (the SwiftUI `@main` menu bar entry point). Depends on `SyncLib`.
+- **`SyncTests`** (`Tests/SyncTests/`) — unit tests for `SyncLib`.
+
+All core services in `SyncLib` are **actors** for thread safety: `SyncEngine`, `AppleRemindersService`, `APIClient`, `MappingStore`.
 
 ### Sync flow
 
@@ -29,7 +36,8 @@ Sync triggers: 60-second timer, `EKEventStoreChanged` (debounced 3s), manual "Sy
 The data backend is the sibling project [`my-reminders`](../my-reminders) — a Next.js 16 app with Neon Postgres via Prisma, deployed on Vercel. It serves both a web UI and a CalDAV endpoint for Apple Reminders native sync.
 
 This sync app pushes data to the server's REST API (default `http://localhost:4001`):
-- `GET /api/tasks` — list all tasks
+- `GET /api/tasks` — list all non-deleted tasks
+- `GET /api/tasks?updatedSince=<ISO>` — incremental pull; includes soft-deleted items marked `{ deleted: true }` so this app can propagate server-side deletions into its local mapping store
 - `POST /api/tasks` — create `{ title, dueDate?, listName?, listColor?, notes?, url?, priority?, completedAt? }`
 - `PATCH /api/tasks/[id]` — update `{ completed?, title?, dueDate?, notes?, url?, priority? }`
 - `DELETE /api/tasks/[id]` — soft delete
@@ -38,7 +46,7 @@ The server stores tasks as iCalendar VTODO objects in the `CalendarObject` Prism
 
 ### State file
 
-`~/.myreminders-sync.json` stores `lastSync` timestamp and `mappings` (Apple calendarItemIdentifier → server task ID). No local database.
+`~/.myreminders-sync.json` stores `lastSync` timestamp and `mappings` (Apple calendarItemIdentifier → `SyncItemState`, which carries the server task ID plus the last-synced Apple mod date and server `updatedAt`). No local database. The decoder in `Models.swift` still accepts the legacy `[String: String]` mapping format for backward compatibility.
 
 ### Key implementation details
 
