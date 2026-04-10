@@ -81,7 +81,22 @@ class AppState: ObservableObject {
     @Published var launchAtLogin = false {
         didSet { updateLaunchAtLogin() }
     }
-    @Published var serverURL: String = UserDefaults.standard.string(forKey: "serverURL") ?? "http://localhost:4001" {
+    // Resolution order mirrors apiToken: process env → dotenv → UserDefaults →
+    // hardcoded localhost fallback. Any hit is mirrored to UserDefaults so the
+    // TextField in the menu bar reflects the active value.
+    @Published var serverURL: String = {
+        if let envURL = ProcessInfo.processInfo.environment["MAC_SYNC_SERVER_URL"],
+           !envURL.isEmpty {
+            UserDefaults.standard.set(envURL, forKey: "serverURL")
+            return envURL
+        }
+        let dotenv = DotEnv.load(from: DotEnv.defaultURL)
+        if let fileURL = dotenv["MAC_SYNC_SERVER_URL"], !fileURL.isEmpty {
+            UserDefaults.standard.set(fileURL, forKey: "serverURL")
+            return fileURL
+        }
+        return UserDefaults.standard.string(forKey: "serverURL") ?? "http://localhost:4001"
+    }() {
         didSet {
             UserDefaults.standard.set(serverURL, forKey: "serverURL")
             recreateEngine()

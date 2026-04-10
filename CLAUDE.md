@@ -37,17 +37,18 @@ The data backend is the sibling project [`my-reminders`](../my-reminders) — a 
 
 This sync app pushes data to the server's REST API (default `http://localhost:4001`). Every request must include `Authorization: Bearer <token>` where the token is the server's `MAC_SYNC_API_TOKEN`. `APIClient.init(baseURL:apiToken:)` takes the token; `authorizedRequest(url:)` attaches the header to every outbound request. A missing or wrong token returns 401 from the server.
 
-**Token resolution (in order, first match wins):**
+**Config resolution (in order, first match wins) — same pattern for both `MAC_SYNC_API_TOKEN` and `MAC_SYNC_SERVER_URL`:**
 
-1. `MAC_SYNC_API_TOKEN` process environment variable — one-off override, e.g. `MAC_SYNC_API_TOKEN=xxx swift run`. Only visible when launched from a shell.
-2. `~/.config/my-reminders-sync/.env` — canonical location. Parsed by `App/DotEnv.swift` (minimal `KEY=VALUE` loader, no dependencies). Works in every launch mode — `swift run`, launch-at-login, Finder — because `$HOME` is always resolvable. Edit with any text editor to rotate.
-3. `UserDefaults` (`apiToken` key) — whatever was last saved, either from one of the sources above (mirrored automatically) or typed into the SecureField in the menu bar UI.
+1. Process environment variable — one-off override, e.g. `MAC_SYNC_SERVER_URL=http://localhost:4001 swift run` for local iteration. Only visible when launched from a shell.
+2. `~/.config/my-reminders-sync/.env` — canonical location. Parsed by `App/DotEnv.swift` (minimal `KEY=VALUE` loader, no dependencies). Works in every launch mode — `swift run`, launch-at-login, Finder — because `$HOME` is always resolvable. Edit with any text editor to change.
+3. `UserDefaults` (`apiToken` / `serverURL` keys) — whatever was last saved, either from one of the sources above (mirrored automatically) or typed into the menu bar UI. For `serverURL` there's a hardcoded `http://localhost:4001` fallback if nothing is set.
 
 Create the .env file once:
 ```bash
 mkdir -p ~/.config/my-reminders-sync
 cat > ~/.config/my-reminders-sync/.env <<EOF
-MAC_SYNC_API_TOKEN=<paste value from my-reminders/.env>
+MAC_SYNC_API_TOKEN=<paste value from my-reminders/.env or Vercel>
+MAC_SYNC_SERVER_URL=https://my-reminders.vercel.app
 EOF
 chmod 600 ~/.config/my-reminders-sync/.env
 ```
