@@ -7,9 +7,19 @@ let package = Package(
         .macOS(.v14)
     ],
     targets: [
+        .target(
+            name: "SyncLib",
+            path: "Sources"
+        ),
         .executableTarget(
             name: "MyRemindersSync",
-            path: "Sources"
+            dependencies: ["SyncLib"],
+            path: "App"
+        ),
+        .testTarget(
+            name: "SyncTests",
+            dependencies: ["SyncLib"],
+            path: "Tests/SyncTests"
         )
     ]
 )

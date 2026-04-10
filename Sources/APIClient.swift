@@ -1,13 +1,13 @@
 import Foundation
 
-actor APIClient {
+public actor APIClient: APIClientProtocol {
     let baseURL: URL
 
-    init(baseURL: URL = URL(string: "http://localhost:4001")!) {
+    public init(baseURL: URL = URL(string: "http://localhost:4001")!) {
         self.baseURL = baseURL
     }
 
-    func fetchAllTasks(updatedSince: Date? = nil) async throws -> [ServerTask] {
+    public func fetchAllTasks(updatedSince: Date? = nil) async throws -> [ServerTask] {
         var components = URLComponents(url: baseURL.appendingPathComponent("api/tasks"), resolvingAgainstBaseURL: false)!
         if let updatedSince {
             components.queryItems = [URLQueryItem(name: "updatedSince", value: ISO8601DateFormatter().string(from: updatedSince))]
@@ -17,7 +17,7 @@ actor APIClient {
         return try JSONDecoder().decode([ServerTask].self, from: data)
     }
 
-    func createTask(
+    public func createTask(
         title: String,
         dueDate: Date? = nil,
         listName: String? = nil,
@@ -50,7 +50,7 @@ actor APIClient {
         return try JSONDecoder().decode(ServerTask.self, from: data)
     }
 
-    func updateTask(
+    public func updateTask(
         id: String,
         completed: Bool? = nil,
         title: String? = nil,
@@ -79,7 +79,7 @@ actor APIClient {
         return try JSONDecoder().decode(ServerTask.self, from: data)
     }
 
-    func deleteTask(id: String) async throws {
+    public func deleteTask(id: String) async throws {
         let url = baseURL.appendingPathComponent("api/tasks/\(id)")
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"

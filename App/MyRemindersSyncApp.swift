@@ -1,6 +1,7 @@
 import SwiftUI
 import EventKit
 import ServiceManagement
+import SyncLib
 
 @main
 struct MyRemindersSyncApp: App {
@@ -24,12 +25,6 @@ struct MenuBarView: View {
                 Text("Last sync: \(lastSync, style: .relative) ago")
             } else {
                 Text("Not synced yet")
-            }
-
-            if let progress = appState.syncProgress {
-                Text(progress)
-                    .font(.caption)
-                    .foregroundColor(.blue)
             }
 
             if let error = appState.lastError {
@@ -77,7 +72,6 @@ class AppState: ObservableObject {
     @Published var lastSyncTime: Date?
     @Published var lastError: String?
     @Published var lastResult: String?
-    @Published var syncProgress: String?
     private var suppressEventStoreNotifications = false
     private var pendingDebounceTask: Task<Void, Never>?
     @Published var launchAtLogin = false {
@@ -131,21 +125,17 @@ class AppState: ObservableObject {
         isSyncing = true
         suppressEventStoreNotifications = true
         lastError = nil
-        syncProgress = "Starting..."
         print("[AppState] Starting sync...")
 
         do {
             let result = try await syncEngine.sync { progress in
-                self.syncProgress = progress.description
                 print("[AppState] \(progress.description)")
             }
             lastSyncTime = Date()
             lastResult = result.totalChanges > 0 ? String(describing: result) : "No changes"
-            syncProgress = nil
             print("[AppState] Sync finished: \(lastResult ?? "")")
         } catch {
             lastError = error.localizedDescription
-            syncProgress = nil
             print("[AppState] Sync ERROR: \(error)")
         }
 
