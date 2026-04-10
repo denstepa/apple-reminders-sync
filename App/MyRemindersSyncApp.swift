@@ -87,7 +87,21 @@ class AppState: ObservableObject {
             recreateEngine()
         }
     }
-    @Published var apiToken: String = UserDefaults.standard.string(forKey: "apiToken") ?? "" {
+    // Token resolution order:
+    //   1. `MAC_SYNC_API_TOKEN` env var (only present when launched from a shell
+    //      via `swift run` — GUI launches via Finder/launchd do NOT inherit
+    //      shell env, so this only helps during development). When found, the
+    //      value is mirrored to UserDefaults so subsequent GUI launches keep
+    //      working without needing env set.
+    //   2. Last value saved to UserDefaults.
+    @Published var apiToken: String = {
+        if let envToken = ProcessInfo.processInfo.environment["MAC_SYNC_API_TOKEN"],
+           !envToken.isEmpty {
+            UserDefaults.standard.set(envToken, forKey: "apiToken")
+            return envToken
+        }
+        return UserDefaults.standard.string(forKey: "apiToken") ?? ""
+    }() {
         didSet {
             UserDefaults.standard.set(apiToken, forKey: "apiToken")
             recreateEngine()
