@@ -35,7 +35,22 @@ Sync triggers: 60-second timer, `EKEventStoreChanged` (debounced 3s), manual "Sy
 
 The data backend is the sibling project [`my-reminders`](../my-reminders) — a Next.js 16 app with Neon Postgres via Prisma, deployed on Vercel. It serves both a web UI and a CalDAV endpoint for Apple Reminders native sync.
 
-This sync app pushes data to the server's REST API (default `http://localhost:4001`). Every request must include `Authorization: Bearer <token>` where the token is the server's `MAC_SYNC_API_TOKEN` — configured in the menu bar UI ("API Token" field) and persisted in `UserDefaults` under the `apiToken` key. `APIClient.init(baseURL:apiToken:)` takes the token; `authorizedRequest(url:)` attaches the header to every outbound request. A missing or wrong token returns 401 from the server.
+This sync app pushes data to the server's REST API (default `http://localhost:4001`). Every request must include `Authorization: Bearer <token>` where the token is the server's `MAC_SYNC_API_TOKEN`. `APIClient.init(baseURL:apiToken:)` takes the token; `authorizedRequest(url:)` attaches the header to every outbound request. A missing or wrong token returns 401 from the server.
+
+**Token resolution (in order, first match wins):**
+
+1. `MAC_SYNC_API_TOKEN` process environment variable — one-off override, e.g. `MAC_SYNC_API_TOKEN=xxx swift run`. Only visible when launched from a shell.
+2. `~/.config/my-reminders-sync/.env` — canonical location. Parsed by `App/DotEnv.swift` (minimal `KEY=VALUE` loader, no dependencies). Works in every launch mode — `swift run`, launch-at-login, Finder — because `$HOME` is always resolvable. Edit with any text editor to rotate.
+3. `UserDefaults` (`apiToken` key) — whatever was last saved, either from one of the sources above (mirrored automatically) or typed into the SecureField in the menu bar UI.
+
+Create the .env file once:
+```bash
+mkdir -p ~/.config/my-reminders-sync
+cat > ~/.config/my-reminders-sync/.env <<EOF
+MAC_SYNC_API_TOKEN=<paste value from my-reminders/.env>
+EOF
+chmod 600 ~/.config/my-reminders-sync/.env
+```
 
 - `GET /api/tasks` — list all non-deleted tasks
 - `GET /api/tasks?updatedSince=<ISO>` — incremental pull; includes soft-deleted items marked `{ deleted: true }` so this app can propagate server-side deletions into its local mapping store

@@ -88,17 +88,28 @@ class AppState: ObservableObject {
         }
     }
     // Token resolution order:
-    //   1. `MAC_SYNC_API_TOKEN` env var (only present when launched from a shell
-    //      via `swift run` — GUI launches via Finder/launchd do NOT inherit
-    //      shell env, so this only helps during development). When found, the
-    //      value is mirrored to UserDefaults so subsequent GUI launches keep
-    //      working without needing env set.
-    //   2. Last value saved to UserDefaults.
+    //   1. `MAC_SYNC_API_TOKEN` process env var (explicit one-off override,
+    //      e.g. `MAC_SYNC_API_TOKEN=xxx swift run` for testing a fresh token
+    //      without touching any file).
+    //   2. `~/.config/my-reminders-sync/.env` — the canonical location. Works
+    //      from every launch mode because it's in $HOME. Edit with any text
+    //      editor to rotate the token.
+    //   3. Last value saved to UserDefaults — survives when neither source
+    //      exists (e.g. someone entered a token manually via the SecureField
+    //      and then deleted the .env file).
+    //
+    // Any source found is mirrored to UserDefaults so the SecureField in the
+    // menu bar always shows the current value.
     @Published var apiToken: String = {
         if let envToken = ProcessInfo.processInfo.environment["MAC_SYNC_API_TOKEN"],
            !envToken.isEmpty {
             UserDefaults.standard.set(envToken, forKey: "apiToken")
             return envToken
+        }
+        let dotenv = DotEnv.load(from: DotEnv.defaultURL)
+        if let fileToken = dotenv["MAC_SYNC_API_TOKEN"], !fileToken.isEmpty {
+            UserDefaults.standard.set(fileToken, forKey: "apiToken")
+            return fileToken
         }
         return UserDefaults.standard.string(forKey: "apiToken") ?? ""
     }() {
