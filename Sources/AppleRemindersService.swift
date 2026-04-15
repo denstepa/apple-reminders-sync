@@ -109,6 +109,94 @@ public actor AppleRemindersService: RemindersServiceProtocol {
         return Self.toReminderItem(reminder)
     }
 
+    // MARK: - Calendar (list) CRUD
+
+    public func fetchAllCalendars() -> [CalendarItem] {
+        store.calendars(for: .reminder).map { Self.toCalendarItem($0) }
+    }
+
+    public func createCalendar(name: String, color: String? = nil) throws -> CalendarItem {
+        guard let source = pickReminderSource() else {
+            throw ReminderError.noSourceAvailable
+        }
+        let calendar = EKCalendar(for: .reminder, eventStore: store)
+        calendar.title = name
+        calendar.source = source
+        if let color, let cgColor = Self.hexToCGColor(color) {
+            calendar.cgColor = cgColor
+        }
+        try store.saveCalendar(calendar, commit: true)
+        return Self.toCalendarItem(calendar)
+    }
+
+    public func renameCalendar(id: String, name: String) throws {
+        guard let calendar = store.calendar(withIdentifier: id) else {
+            throw ReminderError.calendarNotFound
+        }
+        calendar.title = name
+        try store.saveCalendar(calendar, commit: true)
+    }
+
+    public func setCalendarColor(id: String, color: String) throws {
+        guard let calendar = store.calendar(withIdentifier: id) else {
+            throw ReminderError.calendarNotFound
+        }
+        if let cgColor = Self.hexToCGColor(color) {
+            calendar.cgColor = cgColor
+            try store.saveCalendar(calendar, commit: true)
+        }
+    }
+
+    public func deleteCalendar(id: String) throws {
+        guard let calendar = store.calendar(withIdentifier: id) else {
+            return // already gone
+        }
+        // Don't delete the last remaining reminder calendar — EventKit will refuse
+        let allReminderCalendars = store.calendars(for: .reminder)
+        if allReminderCalendars.count <= 1 {
+            throw ReminderError.lastCalendar
+        }
+        try store.removeCalendar(calendar, commit: true)
+    }
+
+    /// Pick the best source for a new reminder calendar: prefer iCloud, fall back to local.
+    private func pickReminderSource() -> EKSource? {
+        let sources = store.sources
+        if let icloud = sources.first(where: {
+            $0.sourceType == .calDAV && $0.title.lowercased().contains("icloud")
+        }) {
+            return icloud
+        }
+        if let calDAV = sources.first(where: {
+            $0.sourceType == .calDAV && !$0.calendars(for: .reminder).isEmpty
+        }) {
+            return calDAV
+        }
+        if let local = sources.first(where: { $0.sourceType == .local }) {
+            return local
+        }
+        return store.defaultCalendarForNewReminders()?.source
+    }
+
+    private static func toCalendarItem(_ calendar: EKCalendar) -> CalendarItem {
+        CalendarItem(
+            calendarIdentifier: calendar.calendarIdentifier,
+            title: calendar.title,
+            color: calendar.cgColor.flatMap { cgColorToHex($0) },
+            allowsContentModifications: calendar.allowsContentModifications
+        )
+    }
+
+    private static func hexToCGColor(_ hex: String) -> CGColor? {
+        var cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.hasPrefix("#") { cleaned.removeFirst() }
+        guard cleaned.count == 6, let value = UInt32(cleaned, radix: 16) else { return nil }
+        let r = CGFloat((value >> 16) & 0xFF) / 255.0
+        let g = CGFloat((value >> 8) & 0xFF) / 255.0
+        let b = CGFloat(value & 0xFF) / 255.0
+        return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+    }
+
     private static func toReminderItem(_ reminder: EKReminder) -> ReminderItem {
         ReminderItem(
             calendarItemIdentifier: reminder.calendarItemIdentifier,
@@ -121,7 +209,8 @@ public actor AppleRemindersService: RemindersServiceProtocol {
             url: reminder.url,
             priority: reminder.priority,
             listName: reminder.calendar.title,
-            listColor: reminder.calendar.cgColor.flatMap { cgColorToHex($0) }
+            listColor: reminder.calendar.cgColor.flatMap { cgColorToHex($0) },
+            listCalendarIdentifier: reminder.calendar.calendarIdentifier
         )
     }
 
@@ -138,6 +227,9 @@ enum ReminderError: LocalizedError {
     case fetchFailed
     case accessDenied
     case notFound
+    case calendarNotFound
+    case noSourceAvailable
+    case lastCalendar
 
     var errorDescription: String? {
         switch self {
@@ -147,6 +239,12 @@ enum ReminderError: LocalizedError {
             return "Access to Reminders denied"
         case .notFound:
             return "Reminder not found"
+        case .calendarNotFound:
+            return "Reminder list not found"
+        case .noSourceAvailable:
+            return "No suitable source available for new reminder list"
+        case .lastCalendar:
+            return "Cannot delete the last remaining reminder list"
         }
     }
 }

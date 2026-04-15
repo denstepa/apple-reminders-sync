@@ -13,6 +13,8 @@ public struct ServerTask: Codable, Sendable {
     public let listId: String
     public let listName: String?
     public let listColor: String?
+    public let appleReminderId: String?
+    public let lastSyncedReminderModifiedAt: String?
     public let createdAt: String
     public let updatedAt: String
     public let deleted: Bool?
@@ -32,6 +34,11 @@ public struct ServerTask: Codable, Sendable {
 
     public var updatedAtParsed: Date {
         Self.parseISO8601(updatedAt) ?? .distantPast
+    }
+
+    public var lastSyncedReminderModifiedAtParsed: Date? {
+        guard let lastSyncedReminderModifiedAt else { return nil }
+        return Self.parseISO8601(lastSyncedReminderModifiedAt)
     }
 
     public static func parseISO8601(_ string: String) -> Date? {
@@ -54,6 +61,8 @@ public struct ServerTask: Codable, Sendable {
         listId: String = "",
         listName: String? = nil,
         listColor: String? = nil,
+        appleReminderId: String? = nil,
+        lastSyncedReminderModifiedAt: String? = nil,
         createdAt: String = "2026-01-01T00:00:00Z",
         updatedAt: String = "2026-01-01T00:00:00Z",
         deleted: Bool? = nil
@@ -70,6 +79,8 @@ public struct ServerTask: Codable, Sendable {
         self.listId = listId
         self.listName = listName
         self.listColor = listColor
+        self.appleReminderId = appleReminderId
+        self.lastSyncedReminderModifiedAt = lastSyncedReminderModifiedAt
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.deleted = deleted
@@ -86,6 +97,9 @@ public struct CreateTaskRequest: Codable {
     public let url: String?
     public let priority: Int?
     public let completedAt: String?
+    public let appleReminderId: String?
+    public let appleReminderListId: String?
+    public let lastSyncedReminderModifiedAt: String?
 }
 
 public struct UpdateTaskRequest: Encodable {
@@ -95,9 +109,12 @@ public struct UpdateTaskRequest: Encodable {
     public let notes: String?
     public let url: String?
     public let priority: Int?
+    public let appleReminderId: String?
+    public let lastSyncedReminderModifiedAt: String?
 
     private enum CodingKeys: String, CodingKey {
-        case completed, title, dueDate, notes, url, priority
+        case completed, title, dueDate, notes, url, priority,
+             appleReminderId, lastSyncedReminderModifiedAt
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -108,85 +125,56 @@ public struct UpdateTaskRequest: Encodable {
         if let notes { try container.encode(notes, forKey: .notes) }
         if let url { try container.encode(url, forKey: .url) }
         if let priority { try container.encode(priority, forKey: .priority) }
+        if let appleReminderId {
+            try container.encode(appleReminderId, forKey: .appleReminderId)
+        }
+        if let lastSyncedReminderModifiedAt {
+            try container.encode(lastSyncedReminderModifiedAt, forKey: .lastSyncedReminderModifiedAt)
+        }
     }
 }
 
-public struct SyncItemState: Codable, Sendable {
-    public var serverId: String
-    public var lastSyncedAppleModDate: Date?
-    public var lastSyncedServerUpdatedAt: Date?
+public struct ServerList: Codable, Sendable {
+    public let id: String
+    public let name: String
+    public let color: String?
+    public let order: Int
+    public let appleReminderListId: String?
+    public let createdAt: String
+    public let updatedAt: String
+    public let deleted: Bool?
 
-    public init(serverId: String, lastSyncedAppleModDate: Date? = nil, lastSyncedServerUpdatedAt: Date? = nil) {
-        self.serverId = serverId
-        self.lastSyncedAppleModDate = lastSyncedAppleModDate
-        self.lastSyncedServerUpdatedAt = lastSyncedServerUpdatedAt
+    public var isDeleted: Bool {
+        deleted == true
+    }
+
+    public var updatedAtParsed: Date {
+        ServerTask.parseISO8601(updatedAt) ?? .distantPast
     }
 }
 
-public struct SyncState: Codable, Sendable {
-    public var lastSync: Date
-    public var mappings: [String: SyncItemState] // appleCalendarItemId -> SyncItemState
+public struct CreateListRequest: Codable {
+    public let name: String
+    public let color: String?
+    public let appleReminderListId: String?
+}
 
-    public static let empty = SyncState(lastSync: .distantPast, mappings: [:])
+public struct UpdateListRequest: Encodable {
+    public let name: String?
+    public let color: String?
+    public let appleReminderListId: String?
 
-    public func serverId(for appleId: String) -> String? {
-        mappings[appleId]?.serverId
+    private enum CodingKeys: String, CodingKey {
+        case name, color, appleReminderListId
     }
 
-    public func appleId(for serverId: String) -> String? {
-        mappings.first(where: { $0.value.serverId == serverId })?.key
-    }
-
-    public func itemState(for appleId: String) -> SyncItemState? {
-        mappings[appleId]
-    }
-
-    public mutating func addMapping(appleId: String, serverId: String, appleModDate: Date? = nil, serverUpdatedAt: Date? = nil) {
-        mappings[appleId] = SyncItemState(
-            serverId: serverId,
-            lastSyncedAppleModDate: appleModDate,
-            lastSyncedServerUpdatedAt: serverUpdatedAt
-        )
-    }
-
-    public mutating func updateTimestamps(appleId: String, appleModDate: Date? = nil, serverUpdatedAt: Date? = nil) {
-        if var item = mappings[appleId] {
-            if let appleModDate { item.lastSyncedAppleModDate = appleModDate }
-            if let serverUpdatedAt { item.lastSyncedServerUpdatedAt = serverUpdatedAt }
-            mappings[appleId] = item
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let name { try container.encode(name, forKey: .name) }
+        if let color { try container.encode(color, forKey: .color) }
+        if let appleReminderListId {
+            try container.encode(appleReminderListId, forKey: .appleReminderListId)
         }
-    }
-
-    public mutating func removeMapping(appleId: String) {
-        mappings.removeValue(forKey: appleId)
-    }
-
-    public mutating func removeMapping(serverId: String) {
-        if let key = appleId(for: serverId) {
-            mappings.removeValue(forKey: key)
-        }
-    }
-
-    // Backward-compatible decoding: supports old [String: String] format
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        lastSync = try container.decode(Date.self, forKey: .lastSync)
-
-        // Try new format first
-        if let newMappings = try? container.decode([String: SyncItemState].self, forKey: .mappings) {
-            mappings = newMappings
-        } else if let oldMappings = try? container.decode([String: String].self, forKey: .mappings) {
-            // Migrate old format
-            mappings = oldMappings.mapValues { serverId in
-                SyncItemState(serverId: serverId, lastSyncedAppleModDate: nil, lastSyncedServerUpdatedAt: nil)
-            }
-        } else {
-            mappings = [:]
-        }
-    }
-
-    public init(lastSync: Date, mappings: [String: SyncItemState]) {
-        self.lastSync = lastSync
-        self.mappings = mappings
     }
 }
+

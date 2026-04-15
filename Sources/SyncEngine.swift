@@ -1,31 +1,174 @@
 import EventKit
 import Foundation
 
-/// Bidirectional sync: Apple Reminders <-> Server
+/// Bidirectional sync: Apple Reminders <-> Server.
+///
+/// No local mapping cache. The Apple↔server identity link lives in two server
+/// columns (`appleReminderId` on tasks, `appleReminderListId` on lists) so a
+/// fresh install / wiped cache cannot cause duplication.
 public actor SyncEngine {
     private let api: any APIClientProtocol
     private let reminders: any RemindersServiceProtocol
-    private let mappingStore: any MappingStoreProtocol
     private let logger = SyncLogger()
 
-    /// Delay between API calls to avoid spamming
+    /// Delay between API calls to avoid spamming the server.
     private let requestDelay: Duration = .milliseconds(50)
 
-    public init(api: any APIClientProtocol, reminders: any RemindersServiceProtocol, mappingStore: any MappingStoreProtocol) {
+    /// In-memory cursor. Lost on restart (first sync after launch is a full pass).
+    /// Used to skip items whose Apple `lastModifiedDate` and server `updatedAt`
+    /// are both older than the last successful sync.
+    private var lastSyncTime: Date = .distantPast
+
+    public init(api: any APIClientProtocol, reminders: any RemindersServiceProtocol) {
         self.api = api
         self.reminders = reminders
-        self.mappingStore = mappingStore
     }
 
     public func sync(progress: @Sendable @MainActor (SyncProgress) -> Void) async throws -> SyncResult {
         var result = SyncResult()
-        var state = try await mappingStore.load()
+        let syncStart = Date()
+        let cursor = lastSyncTime
 
-        // === Phase 1: Gather data ===
+        // ===== Phase 0: Lists =====
+        // List mapping must be settled before tasks so server has the right
+        // `appleReminderListId` rows to route tasks into.
+        try await syncLists(result: &result, progress: progress)
+
+        // ===== Phase 1: Tasks =====
+        try await syncTasks(result: &result, cursor: cursor, progress: progress)
+
+        lastSyncTime = syncStart
+        logger.log("Sync complete: \(result)")
+        return result
+    }
+
+    // MARK: - List sync
+
+    private func syncLists(
+        result: inout SyncResult,
+        progress: @Sendable @MainActor (SyncProgress) -> Void
+    ) async throws {
+        await progress(SyncProgress(phase: "Syncing lists", current: 0, total: 0, skipped: 0))
+
+        // Always pull all lists — they're few and we can't trust a local cursor.
+        let serverLists = try await api.fetchAllLists(updatedSince: nil)
+        let appleCalendars = try await reminders.fetchAllCalendars()
+            .filter { $0.allowsContentModifications }
+
+        var serverByAppleId: [String: ServerList] = [:]
+        var unlinkedServerByName: [String: ServerList] = [:]
+        for list in serverLists where !list.isDeleted {
+            if let appleId = list.appleReminderListId {
+                serverByAppleId[appleId] = list
+            } else {
+                unlinkedServerByName[list.name] = list
+            }
+        }
+
+        var handledServerIds = Set<String>()
+        let appleCalIds = Set(appleCalendars.map { $0.calendarIdentifier })
+
+        // Apple → Server
+        for apple in appleCalendars {
+            if let server = serverByAppleId[apple.calendarIdentifier] {
+                handledServerIds.insert(server.id)
+                let nameChanged = server.name != apple.title
+                let colorChanged = (server.color ?? "") != (apple.color ?? "")
+                if nameChanged || colorChanged {
+                    _ = try await api.updateList(
+                        id: server.id,
+                        name: nameChanged ? apple.title : nil,
+                        color: colorChanged ? apple.color : nil,
+                        appleReminderListId: nil
+                    )
+                    result.listsUpdatedOnServer += 1
+                    logger.log("Updated list on server: \(apple.title)")
+                }
+            } else if let server = unlinkedServerByName[apple.title] {
+                // First-time link — persist the Apple ID on the existing server list.
+                handledServerIds.insert(server.id)
+                _ = try await api.updateList(
+                    id: server.id,
+                    name: nil,
+                    color: nil,
+                    appleReminderListId: apple.calendarIdentifier
+                )
+                logger.log("Linked existing server list to Apple: \(apple.title)")
+            } else {
+                // Truly new in Apple.
+                let created = try await api.createList(
+                    name: apple.title,
+                    color: apple.color,
+                    appleReminderListId: apple.calendarIdentifier
+                )
+                handledServerIds.insert(created.id)
+                result.listsCreatedOnServer += 1
+                logger.log("Created list on server: \(apple.title)")
+            }
+            try? await Task.sleep(for: requestDelay)
+        }
+
+        // Server → Apple
+        for server in serverLists {
+            if handledServerIds.contains(server.id) { continue }
+
+            if server.isDeleted {
+                if let appleId = server.appleReminderListId, appleCalIds.contains(appleId) {
+                    do {
+                        try await reminders.deleteCalendar(id: appleId)
+                        result.listsDeletedOnApple += 1
+                        logger.log("Deleted list in Apple (server deleted): \(server.name)")
+                    } catch {
+                        logger.log("Failed to delete list in Apple: \(error)")
+                    }
+                }
+                continue
+            }
+
+            if let appleId = server.appleReminderListId {
+                if !appleCalIds.contains(appleId) {
+                    // Was linked to Apple, now gone → user deleted in Apple.
+                    do {
+                        try await api.deleteList(id: server.id, moveTo: nil)
+                        result.listsDeletedOnServer += 1
+                        logger.log("Deleted list on server (removed from Apple): \(server.name)")
+                    } catch {
+                        logger.log("Failed to delete list on server: \(error)")
+                    }
+                }
+            } else {
+                // Unlinked server list, no name match either — create in Apple and link back.
+                do {
+                    let created = try await reminders.createCalendar(name: server.name, color: server.color)
+                    _ = try await api.updateList(
+                        id: server.id,
+                        name: nil,
+                        color: nil,
+                        appleReminderListId: created.calendarIdentifier
+                    )
+                    result.listsCreatedOnApple += 1
+                    logger.log("Created list in Apple: \(server.name)")
+                } catch {
+                    logger.log("Failed to create list in Apple: \(error)")
+                }
+            }
+            try? await Task.sleep(for: requestDelay)
+        }
+    }
+
+    // MARK: - Task sync
+
+    private func syncTasks(
+        result: inout SyncResult,
+        cursor: Date,
+        progress: @Sendable @MainActor (SyncProgress) -> Void
+    ) async throws {
+        // Fetch ALL server tasks — needed for Apple-side deletion detection
+        // (we must see every linked server task, not just recently-changed ones).
+        let serverTasks = try await api.fetchAllTasks(updatedSince: nil)
 
         let allReminders = try await reminders.fetchAllReminders()
-
-        // Filter out reminders completed more than 2 months ago
+        // Filter out reminders completed > 2 months ago — they're noise.
         let cutoff = Calendar.current.date(byAdding: .month, value: -2, to: Date())!
         let appleReminders = allReminders.filter { reminder in
             guard reminder.isCompleted, let completionDate = reminder.completionDate else {
@@ -35,229 +178,157 @@ public actor SyncEngine {
         }
         let skipped = allReminders.count - appleReminders.count
 
-        // All reminder IDs (including old completed) — used to distinguish real deletions from cutoff filtering
+        // For deletion detection we need the *unfiltered* set so old completions
+        // aren't mistaken for deletions.
         let allAppleReminderIds = Set(allReminders.map { $0.calendarItemIdentifier })
 
-        // Fetch server changes since last sync
-        let serverChangedTasks = try await api.fetchAllTasks(updatedSince: state.lastSync)
-        var serverChanges: [String: ServerTask] = [:]
-        for task in serverChangedTasks {
-            serverChanges[task.id] = task
+        var serverByAppleId: [String: ServerTask] = [:]
+        for task in serverTasks {
+            if let appleId = task.appleReminderId {
+                serverByAppleId[appleId] = task
+            }
         }
+        let total = appleReminders.count + serverTasks.count
+        await progress(SyncProgress(phase: "Syncing tasks", current: 0, total: total, skipped: skipped))
 
-        let total = appleReminders.count + serverChanges.count
-        await progress(SyncProgress(phase: "Syncing", current: 0, total: total, skipped: skipped))
+        // ----- Apple → Server -----
+        for (index, apple) in appleReminders.enumerated() {
+            let server = serverByAppleId[apple.calendarItemIdentifier]
 
-        // Track which server tasks were already handled during Apple->Server phase
-        var handledServerIds = Set<String>()
+            // Fast skip: item is linked to a non-deleted server task and neither
+            // side changed since the last successful sync. Avoids 468 no-op
+            // iterations × 50ms when nothing happened.
+            if let server, !server.isDeleted,
+               let appleMod = apple.lastModifiedDate, appleMod <= cursor,
+               let serverMod = ServerTask.parseISO8601(server.updatedAt), serverMod <= cursor {
+                continue
+            }
 
-        // === Phase 2: Apple -> Server ===
+            var didWork = false
 
-        for (index, reminder) in appleReminders.enumerated() {
-            let appleId = reminder.calendarItemIdentifier
-            let title = reminder.title
-            let dueDate = reminder.dueDateComponents.flatMap { Calendar.current.date(from: $0) }
-            let notes = reminder.notes
-            let reminderURL = reminder.url?.absoluteString
-            let priority = reminder.priority
-            let listName = reminder.listName
-            let listColor = reminder.listColor
-
-            if let itemState = state.itemState(for: appleId) {
-                let serverId = itemState.serverId
-                // Tolerance of 1s to account for Date precision loss during ISO8601 serialization
-                let appleChanged = reminder.lastModifiedDate.map {
-                    $0.timeIntervalSince(itemState.lastSyncedAppleModDate ?? .distantPast) > 1.0
-                } ?? false
+            if let server, server.isDeleted {
+                try await reminders.deleteReminder(id: apple.calendarItemIdentifier)
+                result.deletedOnApple += 1
+                logger.log("Deleted in Apple (server deleted): \(server.title)")
+                didWork = true
+            } else if let server {
+                let storedAppleMod = server.lastSyncedReminderModifiedAtParsed ?? .distantPast
+                let appleMod = apple.lastModifiedDate ?? .distantPast
+                let appleChanged = appleMod.timeIntervalSince(storedAppleMod) > 1.0
 
                 if appleChanged {
-                    if let serverTask = serverChanges[serverId], !serverTask.isDeleted {
-                        // Conflict: both sides changed — last-writer-wins
-                        handledServerIds.insert(serverId)
-                        result.conflicts += 1
-
-                        let appleDate = reminder.lastModifiedDate ?? .distantPast
-                        let serverDate = serverTask.updatedAtParsed
-
-                        if appleDate > serverDate {
-                            // Apple wins — push to server
-                            let updated = try await api.updateTask(
-                                id: serverId,
-                                completed: reminder.isCompleted,
-                                title: title,
-                                dueDate: dueDate,
-                                notes: notes,
-                                url: reminderURL,
-                                priority: priority
-                            )
-                            state.updateTimestamps(appleId: appleId, appleModDate: reminder.lastModifiedDate, serverUpdatedAt: updated.updatedAtParsed)
-                            result.updatedOnServer += 1
-                            logger.log("Conflict (Apple wins): \(title)")
-                        } else {
-                            // Server wins — update Apple reminder
-                            try await applyServerTaskToReminder(serverTask, reminderId: appleId)
-                            // Use current time — EventKit bumps lastModifiedDate on save but cache may be stale
-                            state.updateTimestamps(appleId: appleId, appleModDate: Date(), serverUpdatedAt: serverTask.updatedAtParsed)
-                            result.updatedOnApple += 1
-                            logger.log("Conflict (Server wins): \(title)")
-                        }
-                    } else if let serverTask = serverChanges[serverId], serverTask.isDeleted {
-                        // Server deleted it, but Apple changed it — server deletion wins
-                        handledServerIds.insert(serverId)
-                        try await reminders.deleteReminder(id: appleId)
-                        state.removeMapping(appleId: appleId)
-                        result.deletedOnApple += 1
-                        logger.log("Deleted from Apple (server deleted): \(title)")
-                    } else {
-                        // No server conflict — push Apple changes to server
-                        let updated = try await api.updateTask(
-                            id: serverId,
-                            completed: reminder.isCompleted,
-                            title: title,
-                            dueDate: dueDate,
-                            notes: notes,
-                            url: reminderURL,
-                            priority: priority
-                        )
-                        state.updateTimestamps(appleId: appleId, appleModDate: reminder.lastModifiedDate, serverUpdatedAt: updated.updatedAtParsed)
-                        result.updatedOnServer += 1
-                        logger.log("Updated on server: \(title)")
-                    }
-                    try? await Task.sleep(for: requestDelay)
-                } else {
-                    // Apple didn't change — if server changed, it'll be handled in Phase 3
-                    if let serverTask = serverChanges[serverId] {
-                        // Mark as not handled yet — Phase 3 will process it
-                        _ = serverTask
-                    }
+                    _ = try await api.updateTask(
+                        id: server.id,
+                        completed: apple.isCompleted,
+                        title: apple.title,
+                        dueDate: apple.dueDateComponents.flatMap { Calendar.current.date(from: $0) },
+                        notes: apple.notes,
+                        url: apple.url?.absoluteString,
+                        priority: apple.priority,
+                        appleReminderId: nil,
+                        lastSyncedReminderModifiedAt: apple.lastModifiedDate
+                    )
+                    result.updatedOnServer += 1
+                    logger.log("Updated on server: \(apple.title)")
+                    didWork = true
+                } else if !taskContentMatches(server: server, apple: apple) {
+                    // Apple unchanged since last sync, but server has different
+                    // content → server is the newer side, push to Apple.
+                    try await applyServerTaskToReminder(server, reminderId: apple.calendarItemIdentifier)
+                    let refreshed = await reminders.reminder(withId: apple.calendarItemIdentifier)
+                    _ = try? await api.updateTask(
+                        id: server.id,
+                        completed: nil,
+                        title: nil,
+                        dueDate: nil,
+                        notes: nil,
+                        url: nil,
+                        priority: nil,
+                        appleReminderId: nil,
+                        lastSyncedReminderModifiedAt: refreshed?.lastModifiedDate
+                    )
+                    result.updatedOnApple += 1
+                    logger.log("Updated in Apple (server changed): \(server.title)")
+                    didWork = true
                 }
             } else {
-                // New in Apple — create on server
-                let serverTask = try await api.createTask(
-                    title: title,
-                    dueDate: dueDate,
-                    listName: listName,
-                    listColor: listColor,
-                    notes: notes,
-                    url: reminderURL,
-                    priority: priority,
-                    completedAt: reminder.completionDate
+                // No server task linked to this Apple reminder → create.
+                let created = try await api.createTask(
+                    title: apple.title,
+                    dueDate: apple.dueDateComponents.flatMap { Calendar.current.date(from: $0) },
+                    listName: apple.listName,
+                    listColor: apple.listColor,
+                    notes: apple.notes,
+                    url: apple.url?.absoluteString,
+                    priority: apple.priority,
+                    completedAt: apple.completionDate,
+                    appleReminderId: apple.calendarItemIdentifier,
+                    appleReminderListId: apple.listCalendarIdentifier.isEmpty ? nil : apple.listCalendarIdentifier,
+                    lastSyncedReminderModifiedAt: apple.lastModifiedDate
                 )
-                state.addMapping(
-                    appleId: appleId,
-                    serverId: serverTask.id,
-                    appleModDate: reminder.lastModifiedDate,
-                    serverUpdatedAt: serverTask.updatedAtParsed
-                )
+                serverByAppleId[apple.calendarItemIdentifier] = created
                 result.createdOnServer += 1
+                logger.log("Created on server: \(apple.title)")
+                didWork = true
+            }
 
-                if reminder.isCompleted {
-                    let _ = try await api.updateTask(id: serverTask.id, completed: true, title: nil, dueDate: nil, notes: nil, url: nil, priority: nil)
-                }
-
+            if didWork {
                 try? await Task.sleep(for: requestDelay)
             }
 
             if (index + 1) % 50 == 0 || index == appleReminders.count - 1 {
                 await progress(SyncProgress(phase: "Syncing (Apple → Server)", current: index + 1, total: total, skipped: skipped))
-                try await mappingStore.save(state)
             }
         }
 
-        // Handle Apple-side deletions (mapped items truly removed, not just filtered by cutoff)
-        let deletedFromApple = state.mappings.filter { !allAppleReminderIds.contains($0.key) }
-        for (appleId, itemState) in deletedFromApple {
-            let serverId = itemState.serverId
+        // ----- Apple-side deletions -----
+        // Only delete on server when we have positive evidence: the task was
+        // synced before (lastSyncedReminderModifiedAt != nil) and is now gone
+        // from Apple's full set.
+        for server in serverTasks where !server.isDeleted {
+            guard let appleId = server.appleReminderId,
+                  server.lastSyncedReminderModifiedAt != nil,
+                  !allAppleReminderIds.contains(appleId)
+            else { continue }
 
-            if let serverTask = serverChanges[serverId], !serverTask.isDeleted {
-                // Server modified it but Apple deleted it — recreate in Apple (server wins)
-                handledServerIds.insert(serverId)
-                let newReminder = try await createReminderFromServerTask(serverTask)
-                state.removeMapping(appleId: appleId)
-                state.addMapping(
-                    appleId: newReminder.calendarItemIdentifier,
-                    serverId: serverId,
-                    appleModDate: newReminder.lastModifiedDate,
-                    serverUpdatedAt: serverTask.updatedAtParsed
-                )
-                result.createdOnApple += 1
-                logger.log("Recreated in Apple (server modified, Apple deleted): \(serverTask.title)")
-            } else {
-                // Delete on server
-                handledServerIds.insert(serverId)
-                try await api.deleteTask(id: serverId)
-                state.removeMapping(appleId: appleId)
+            do {
+                try await api.deleteTask(id: server.id)
                 result.deletedOnServer += 1
-                logger.log("Deleted on server (removed from Apple): \(serverId)")
+                logger.log("Deleted on server (removed from Apple): \(server.title)")
+            } catch {
+                logger.log("Failed to delete on server: \(error)")
             }
             try? await Task.sleep(for: requestDelay)
         }
 
-        // === Phase 3: Server -> Apple ===
-
-        let serverOnlyChanges = serverChanges.filter { !handledServerIds.contains($0.key) }
+        // ----- Server → Apple: create unsynced server tasks -----
         var serverIndex = 0
-
-        for (serverId, serverTask) in serverOnlyChanges {
+        for server in serverTasks where server.appleReminderId == nil && !server.isDeleted {
             serverIndex += 1
-
-            if serverTask.isDeleted {
-                // Deleted on server — delete from Apple if mapped
-                if let appleId = state.appleId(for: serverId) {
-                    if await reminders.reminder(withId: appleId) != nil {
-                        try await reminders.deleteReminder(id: appleId)
-                        result.deletedOnApple += 1
-                        logger.log("Deleted from Apple (server deleted): \(serverTask.title)")
-                    }
-                    state.removeMapping(appleId: appleId)
-                }
-            } else if let appleId = state.appleId(for: serverId) {
-                // Mapped and server changed — update Apple reminder
-                if await reminders.reminder(withId: appleId) != nil {
-                    try await applyServerTaskToReminder(serverTask, reminderId: appleId)
-                    state.updateTimestamps(appleId: appleId, appleModDate: Date(), serverUpdatedAt: serverTask.updatedAtParsed)
-                    result.updatedOnApple += 1
-                    logger.log("Updated in Apple: \(serverTask.title)")
-                } else {
-                    // Reminder not found (ID changed?) — recreate
-                    state.removeMapping(appleId: appleId)
-                    let newReminder = try await createReminderFromServerTask(serverTask)
-                    state.addMapping(
-                        appleId: newReminder.calendarItemIdentifier,
-                        serverId: serverId,
-                        appleModDate: newReminder.lastModifiedDate,
-                        serverUpdatedAt: serverTask.updatedAtParsed
-                    )
-                    result.createdOnApple += 1
-                    logger.log("Recreated in Apple (ID changed): \(serverTask.title)")
-                }
-            } else {
-                // New on server — create in Apple
-                let newReminder = try await createReminderFromServerTask(serverTask)
-                state.addMapping(
-                    appleId: newReminder.calendarItemIdentifier,
-                    serverId: serverId,
-                    appleModDate: newReminder.lastModifiedDate,
-                    serverUpdatedAt: serverTask.updatedAtParsed
+            do {
+                let created = try await createReminderFromServerTask(server)
+                _ = try await api.updateTask(
+                    id: server.id,
+                    completed: nil,
+                    title: nil,
+                    dueDate: nil,
+                    notes: nil,
+                    url: nil,
+                    priority: nil,
+                    appleReminderId: created.calendarItemIdentifier,
+                    lastSyncedReminderModifiedAt: created.lastModifiedDate
                 )
                 result.createdOnApple += 1
-                logger.log("Created in Apple: \(serverTask.title)")
+                logger.log("Created in Apple: \(server.title)")
+            } catch {
+                logger.log("Failed to create in Apple: \(error)")
             }
-            try? await Task.sleep(for: requestDelay)
 
-            if serverIndex % 50 == 0 || serverIndex == serverOnlyChanges.count {
+            try? await Task.sleep(for: requestDelay)
+            if serverIndex % 50 == 0 {
                 await progress(SyncProgress(phase: "Syncing (Server → Apple)", current: appleReminders.count + serverIndex, total: total, skipped: skipped))
-                try await mappingStore.save(state)
             }
         }
-
-        // === Phase 4: Finalize ===
-
-        state.lastSync = Date()
-        try await mappingStore.save(state)
-
-        logger.log("Sync complete: \(result) (skipped \(skipped) old completed)")
-        return result
     }
 
     // MARK: - Helpers
@@ -277,7 +348,7 @@ public actor SyncEngine {
     }
 
     private func createReminderFromServerTask(_ task: ServerTask) async throws -> ReminderItem {
-        return try await reminders.createReminder(
+        try await reminders.createReminder(
             title: task.title,
             dueDate: task.dueDateParsed,
             isCompleted: task.isCompleted,
@@ -286,6 +357,25 @@ public actor SyncEngine {
             priority: task.priority ?? 0,
             listName: task.listName
         )
+    }
+
+    /// Compare the fields the user actually edits. If the server differs from
+    /// Apple AND Apple hasn't changed since last sync, the server is newer.
+    private nonisolated func taskContentMatches(server: ServerTask, apple: ReminderItem) -> Bool {
+        if server.title != apple.title { return false }
+        if (server.notes ?? "") != (apple.notes ?? "") { return false }
+        if (server.url ?? "") != (apple.url?.absoluteString ?? "") { return false }
+        if (server.priority ?? 0) != apple.priority { return false }
+        if server.isCompleted != apple.isCompleted { return false }
+
+        let serverDue = server.dueDateParsed
+        let appleDue = apple.dueDateComponents.flatMap { Calendar.current.date(from: $0) }
+        if let s = serverDue, let a = appleDue {
+            if abs(s.timeIntervalSince(a)) > 1.0 { return false }
+        } else if (serverDue == nil) != (appleDue == nil) {
+            return false
+        }
+        return true
     }
 }
 
@@ -312,21 +402,38 @@ public struct SyncResult: CustomStringConvertible {
     public var deletedOnApple = 0
     public var conflicts = 0
 
+    public var listsCreatedOnServer = 0
+    public var listsUpdatedOnServer = 0
+    public var listsDeletedOnServer = 0
+    public var listsCreatedOnApple = 0
+    public var listsUpdatedOnApple = 0
+    public var listsDeletedOnApple = 0
+
     public var totalChanges: Int {
         createdOnServer + updatedOnServer + deletedOnServer +
-        createdOnApple + updatedOnApple + deletedOnApple
+        createdOnApple + updatedOnApple + deletedOnApple +
+        listsCreatedOnServer + listsUpdatedOnServer + listsDeletedOnServer +
+        listsCreatedOnApple + listsUpdatedOnApple + listsDeletedOnApple
     }
 
     public var description: String {
         var parts: [String] = []
         let serverChanges = createdOnServer + updatedOnServer + deletedOnServer
         let appleChanges = createdOnApple + updatedOnApple + deletedOnApple
+        let listServerChanges = listsCreatedOnServer + listsUpdatedOnServer + listsDeletedOnServer
+        let listAppleChanges = listsCreatedOnApple + listsUpdatedOnApple + listsDeletedOnApple
 
         if serverChanges > 0 {
             parts.append("Server(+\(createdOnServer) ~\(updatedOnServer) -\(deletedOnServer))")
         }
         if appleChanges > 0 {
             parts.append("Apple(+\(createdOnApple) ~\(updatedOnApple) -\(deletedOnApple))")
+        }
+        if listServerChanges > 0 {
+            parts.append("Lists-Server(+\(listsCreatedOnServer) ~\(listsUpdatedOnServer) -\(listsDeletedOnServer))")
+        }
+        if listAppleChanges > 0 {
+            parts.append("Lists-Apple(+\(listsCreatedOnApple) ~\(listsUpdatedOnApple) -\(listsDeletedOnApple))")
         }
         if conflicts > 0 {
             parts.append("Conflicts: \(conflicts)")

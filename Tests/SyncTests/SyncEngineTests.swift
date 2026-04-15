@@ -4,17 +4,23 @@ import XCTest
 @MainActor
 final class SyncEngineTests: XCTestCase {
 
-    // Helper: run a sync and return the result
     private func runSync(engine: SyncEngine) async throws -> SyncResult {
         try await engine.sync { _ in }
     }
 
-    // MARK: - Apple -> Server
+    private func iso(_ date: Date) -> String {
+        ISO8601DateFormatter.withMillis.string(from: date)
+    }
 
-    func test_newAppleReminder_createsOnServer() async throws {
+    private func makeEngine(api: MockAPIClient, reminders: MockRemindersService) -> SyncEngine {
+        SyncEngine(api: api, reminders: reminders)
+    }
+
+    // MARK: - Apple → Server
+
+    func test_newAppleReminder_createsOnServerWithAppleId() async throws {
         let api = MockAPIClient()
         let reminders = MockRemindersService()
-        let store = MockMappingStore()
 
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
@@ -22,321 +28,299 @@ final class SyncEngineTests: XCTestCase {
             lastModifiedDate: Date()
         ))
 
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.createdOnServer, 1)
         let createCalls = await api.createCalls
         XCTAssertEqual(createCalls, ["Buy milk"])
-
-        let state = await store.current()
-        XCTAssertNotNil(state.serverId(for: "apple-1"))
+        // Server side should now have the Apple ID stored.
+        let serverTasks = await api.tasks
+        let task = serverTasks.values.first(where: { $0.appleReminderId == "apple-1" })
+        XCTAssertNotNil(task)
+        XCTAssertNotNil(task?.lastSyncedReminderModifiedAt)
     }
 
     func test_appleReminderEdited_updatesServer() async throws {
+        let past = Date().addingTimeInterval(-3600)
+        let now = Date()
+
         let api = MockAPIClient()
         let reminders = MockRemindersService()
-        let oldSyncTime = Date().addingTimeInterval(-3600)
-        var state = SyncState.empty
-        state.lastSync = oldSyncTime
-        state.addMapping(appleId: "apple-1", serverId: "server-1", appleModDate: oldSyncTime, serverUpdatedAt: oldSyncTime)
-        let store = MockMappingStore(initialState: state)
 
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "Buy milk",
+            appleReminderId: "apple-1",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(past)
+        ))
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
             title: "Buy milk UPDATED",
-            lastModifiedDate: Date() // modified now
+            lastModifiedDate: now
         ))
-        await api.seed(ServerTask(id: "server-1", title: "Buy milk",
-                                  createdAt: ISO8601DateFormatter.withMillis.string(from: oldSyncTime),
-                                  updatedAt: ISO8601DateFormatter.withMillis.string(from: oldSyncTime)))
 
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.updatedOnServer, 1)
-        let updateCalls = await api.updateCalls
-        XCTAssertEqual(updateCalls.count, 1)
-        XCTAssertEqual(updateCalls.first?.title, "Buy milk UPDATED")
+        let updates = await api.updateCalls
+        XCTAssertEqual(updates.first?.title, "Buy milk UPDATED")
     }
 
-    func test_appleReminderDeleted_deletesFromServer() async throws {
+    func test_appleReminderDeleted_deletesOnServer_whenLastSyncedSet() async throws {
+        let past = Date().addingTimeInterval(-3600)
         let api = MockAPIClient()
         let reminders = MockRemindersService()
 
-        var state = SyncState.empty
-        state.lastSync = Date().addingTimeInterval(-3600)
-        state.addMapping(appleId: "apple-gone", serverId: "server-1")
-        let store = MockMappingStore(initialState: state)
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "Old task",
+            appleReminderId: "apple-gone",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(past)
+        ))
+        // No Apple reminder for "apple-gone".
 
-        // No apple reminder exists — Apple deleted it
-        await api.seed(ServerTask(id: "server-1", title: "Old task",
-                                  updatedAt: ISO8601DateFormatter.withMillis.string(from: Date().addingTimeInterval(-7200))))
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.deletedOnServer, 1)
         let deleteCalls = await api.deleteCalls
         XCTAssertEqual(deleteCalls, ["server-1"])
     }
 
-    // MARK: - Server -> Apple
+    func test_unsyncedAppleId_neverDeletesOnServer() async throws {
+        // Server task has appleReminderId but lastSyncedReminderModifiedAt is nil
+        // → never actually synced TO Apple. Don't treat its absence as deletion.
+        let api = MockAPIClient()
+        let reminders = MockRemindersService()
 
-    func test_newServerTask_createsInApple() async throws {
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "Web-only",
+            appleReminderId: "apple-ghost",
+            lastSyncedReminderModifiedAt: nil,
+            createdAt: iso(Date()),
+            updatedAt: iso(Date())
+        ))
+
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
+
+        XCTAssertEqual(result.deletedOnServer, 0)
+        let deletes = await api.deleteCalls
+        XCTAssertTrue(deletes.isEmpty)
+    }
+
+    // MARK: - Server → Apple
+
+    func test_serverTaskWithoutAppleId_createsInApple_andStampsBack() async throws {
         let api = MockAPIClient(initialTasks: [
-            ServerTask(id: "server-1", title: "Server task",
-                       updatedAt: ISO8601DateFormatter.withMillis.string(from: Date()))
+            ServerTask(
+                id: "server-1",
+                title: "Server task",
+                appleReminderId: nil,
+                createdAt: iso(Date()),
+                updatedAt: iso(Date())
+            )
         ])
         let reminders = MockRemindersService()
-        let store = MockMappingStore()
 
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.createdOnApple, 1)
         let createCalls = await reminders.createCalls
         XCTAssertEqual(createCalls, ["Server task"])
 
-        let state = await store.current()
-        XCTAssertNotNil(state.appleId(for: "server-1"))
+        // Server should now have the appleReminderId patched in.
+        let updated = await api.tasks["server-1"]
+        XCTAssertNotNil(updated?.appleReminderId)
+        XCTAssertNotNil(updated?.lastSyncedReminderModifiedAt)
     }
 
     func test_serverTaskUpdated_updatesAppleReminder() async throws {
         let past = Date().addingTimeInterval(-3600)
-        let now = Date()
 
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(
-            appleId: "apple-1",
-            serverId: "server-1",
-            appleModDate: past,
-            serverUpdatedAt: past
-        )
-        let store = MockMappingStore(initialState: state)
-
+        let api = MockAPIClient()
         let reminders = MockRemindersService()
-        // Apple reminder with OLD lastModified (not changed since last sync)
+
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "NEW title from server",
+            appleReminderId: "apple-1",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(Date())
+        ))
+        // Apple side hasn't changed since past.
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
             title: "Old title",
             lastModifiedDate: past
         ))
 
-        let api = MockAPIClient(initialTasks: [
-            ServerTask(id: "server-1", title: "NEW title from server",
-                       updatedAt: ISO8601DateFormatter.withMillis.string(from: now))
-        ])
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.updatedOnApple, 1)
         let updates = await reminders.updateCalls
-        XCTAssertEqual(updates.count, 1)
         XCTAssertEqual(updates.first?.title, "NEW title from server")
-    }
-
-    func test_serverTaskMarkedCompleted_marksAppleReminderComplete() async throws {
-        let past = Date().addingTimeInterval(-3600)
-        let now = Date()
-
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
-        let reminders = MockRemindersService()
-        await reminders.seed(ReminderItem(
-            calendarItemIdentifier: "apple-1",
-            title: "Task",
-            isCompleted: false,
-            lastModifiedDate: past
-        ))
-
-        let api = MockAPIClient(initialTasks: [
-            ServerTask(
-                id: "server-1",
-                title: "Task",
-                completedAt: ISO8601DateFormatter.withMillis.string(from: now),
-                status: "completed",
-                updatedAt: ISO8601DateFormatter.withMillis.string(from: now)
-            )
-        ])
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
-
-        XCTAssertEqual(result.updatedOnApple, 1)
-        let updates = await reminders.updateCalls
-        XCTAssertTrue(updates.first?.isCompleted == true)
-
-        let updated = await reminders.reminder(withId: "apple-1")
-        XCTAssertEqual(updated?.isCompleted, true)
     }
 
     func test_serverTaskDeleted_deletesAppleReminder() async throws {
         let past = Date().addingTimeInterval(-3600)
-
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
+        let api = MockAPIClient()
         let reminders = MockRemindersService()
+
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "To delete",
+            appleReminderId: "apple-1",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(Date()),
+            deleted: true
+        ))
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
             title: "To delete",
             lastModifiedDate: past
         ))
 
-        let api = MockAPIClient()
-        await api.seed(ServerTask(id: "server-1", title: "To delete",
-                                  updatedAt: ISO8601DateFormatter.withMillis.string(from: Date()),
-                                  deleted: true))
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.deletedOnApple, 1)
-        let deleteCalls = await reminders.deleteCalls
-        XCTAssertEqual(deleteCalls, ["apple-1"])
-
-        let remaining = await reminders.reminder(withId: "apple-1")
-        XCTAssertNil(remaining)
+        let deletes = await reminders.deleteCalls
+        XCTAssertEqual(deletes, ["apple-1"])
     }
 
-    // MARK: - Conflict resolution
+    // MARK: - The duplication regression
 
-    func test_conflict_appleNewer_appleWins() async throws {
+    func test_freshSync_doesNotDuplicate_whenServerAlreadyKnowsTask() async throws {
+        // Simulates the bug scenario: the Mac client has no local cache.
+        // Server already knows the Apple reminder via appleReminderId.
+        // A re-sync must NOT create a second copy on the server.
         let past = Date().addingTimeInterval(-3600)
-        let serverChange = Date().addingTimeInterval(-10)
-        let appleChange = Date() // most recent
-
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
+        let api = MockAPIClient()
         let reminders = MockRemindersService()
+
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "Buy milk",
+            appleReminderId: "apple-1",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(past)
+        ))
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
-            title: "Apple version",
-            lastModifiedDate: appleChange
+            title: "Buy milk",
+            lastModifiedDate: past
         ))
 
-        let api = MockAPIClient(initialTasks: [
-            ServerTask(id: "server-1", title: "Server version",
-                       updatedAt: ISO8601DateFormatter.withMillis.string(from: serverChange))
-        ])
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
-
-        XCTAssertEqual(result.conflicts, 1)
-        XCTAssertEqual(result.updatedOnServer, 1)
-        XCTAssertEqual(result.updatedOnApple, 0)
-
-        let updateCalls = await api.updateCalls
-        XCTAssertEqual(updateCalls.first?.title, "Apple version")
+        XCTAssertEqual(result.createdOnServer, 0)
+        XCTAssertEqual(result.createdOnApple, 0)
+        let serverTasks = await api.tasks
+        let appleReminders = await reminders.reminders
+        XCTAssertEqual(serverTasks.count, 1)
+        XCTAssertEqual(appleReminders.count, 1)
     }
 
-    func test_conflict_serverNewer_serverWins() async throws {
-        let past = Date().addingTimeInterval(-3600)
-        let appleChange = Date().addingTimeInterval(-10)
-        let serverChange = Date() // most recent
-
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
-        let reminders = MockRemindersService()
-        await reminders.seed(ReminderItem(
-            calendarItemIdentifier: "apple-1",
-            title: "Apple version",
-            lastModifiedDate: appleChange
-        ))
-
-        let api = MockAPIClient(initialTasks: [
-            ServerTask(id: "server-1", title: "Server version",
-                       updatedAt: ISO8601DateFormatter.withMillis.string(from: serverChange))
-        ])
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
-
-        XCTAssertEqual(result.conflicts, 1)
-        XCTAssertEqual(result.updatedOnApple, 1)
-        XCTAssertEqual(result.updatedOnServer, 0)
-
-        let updates = await reminders.updateCalls
-        XCTAssertEqual(updates.first?.title, "Server version")
-    }
-
-    // MARK: - Idempotency / no-op
+    // MARK: - Idempotency
 
     func test_noChanges_producesNoWork() async throws {
         let past = Date().addingTimeInterval(-3600)
-
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
+        let api = MockAPIClient()
         let reminders = MockRemindersService()
+
+        await api.seed(ServerTask(
+            id: "server-1",
+            title: "Same",
+            appleReminderId: "apple-1",
+            lastSyncedReminderModifiedAt: iso(past),
+            createdAt: iso(past),
+            updatedAt: iso(past)
+        ))
         await reminders.seed(ReminderItem(
             calendarItemIdentifier: "apple-1",
             title: "Same",
             lastModifiedDate: past
         ))
 
-        let api = MockAPIClient()
-        // No server changes — task exists but updatedAt is older than lastSync
-        await api.seed(ServerTask(id: "server-1", title: "Same",
-                                  updatedAt: ISO8601DateFormatter.withMillis.string(from: past.addingTimeInterval(-100))))
-
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
         XCTAssertEqual(result.totalChanges, 0)
-        XCTAssertEqual(result.conflicts, 0)
     }
 
-    func test_completeInApple_pushesCompletedToServer() async throws {
-        let past = Date().addingTimeInterval(-3600)
-        let now = Date()
+    // MARK: - Lists
 
-        var state = SyncState.empty
-        state.lastSync = past
-        state.addMapping(appleId: "apple-1", serverId: "server-1",
-                         appleModDate: past, serverUpdatedAt: past)
-        let store = MockMappingStore(initialState: state)
-
+    func test_freshAppleCalendar_createsServerListWithAppleId() async throws {
+        let api = MockAPIClient()
         let reminders = MockRemindersService()
-        await reminders.seed(ReminderItem(
-            calendarItemIdentifier: "apple-1",
-            title: "Task",
-            isCompleted: true,
-            completionDate: now,
-            lastModifiedDate: now
+        await reminders.seedCalendar(CalendarItem(
+            calendarIdentifier: "cal-apple-1",
+            title: "Work",
+            color: "#FF0000"
         ))
 
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
+
+        XCTAssertEqual(result.listsCreatedOnServer, 1)
+        let serverLists = await api.lists
+        XCTAssertEqual(serverLists.values.first?.appleReminderListId, "cal-apple-1")
+    }
+
+    func test_serverListWithoutAppleId_createsAppleCalendar_andLinksBack() async throws {
         let api = MockAPIClient()
-        await api.seed(ServerTask(id: "server-1", title: "Task",
-                                  updatedAt: ISO8601DateFormatter.withMillis.string(from: past)))
+        let reminders = MockRemindersService()
+        await api.seed(ServerList(
+            id: "list-1",
+            name: "Web list",
+            color: "#00FF00",
+            order: 0,
+            appleReminderListId: nil,
+            createdAt: iso(Date()),
+            updatedAt: iso(Date()),
+            deleted: nil
+        ))
 
-        let engine = SyncEngine(api: api, reminders: reminders, mappingStore: store)
-        let result = try await runSync(engine: engine)
+        let result = try await runSync(engine: makeEngine(api: api, reminders: reminders))
 
-        XCTAssertEqual(result.updatedOnServer, 1)
-        let updateCalls = await api.updateCalls
-        XCTAssertEqual(updateCalls.first?.completed, true)
+        XCTAssertEqual(result.listsCreatedOnApple, 1)
+        let serverList = await api.lists["list-1"]
+        XCTAssertNotNil(serverList?.appleReminderListId)
+    }
+
+    func test_existingMatchByName_linksWithoutDuplicating() async throws {
+        // Server has list "Work" without Apple link. Apple has "Work" too.
+        // Should link, not create a new list on either side.
+        let api = MockAPIClient()
+        let reminders = MockRemindersService()
+        await api.seed(ServerList(
+            id: "list-1",
+            name: "Work",
+            color: "#FF0000",
+            order: 0,
+            appleReminderListId: nil,
+            createdAt: iso(Date()),
+            updatedAt: iso(Date()),
+            deleted: nil
+        ))
+        await reminders.seedCalendar(CalendarItem(
+            calendarIdentifier: "cal-apple-1",
+            title: "Work",
+            color: "#FF0000"
+        ))
+
+        _ = try await runSync(engine: makeEngine(api: api, reminders: reminders))
+
+        let createCalls = await api.createListCalls
+        XCTAssertTrue(createCalls.isEmpty, "should not have created a duplicate server list")
+        let calCreates = await reminders.createCalendarCalls
+        XCTAssertTrue(calCreates.isEmpty, "should not have created a duplicate Apple calendar")
+        // Linked
+        let serverList = await api.lists["list-1"]
+        XCTAssertEqual(serverList?.appleReminderListId, "cal-apple-1")
     }
 }

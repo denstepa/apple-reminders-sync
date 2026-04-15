@@ -4,6 +4,15 @@ public actor APIClient: APIClientProtocol {
     let baseURL: URL
     let apiToken: String?
 
+    /// Server expects fractional-second ISO8601 (matches Prisma's serialized
+    /// `updatedAt`). Without this, round-tripped timestamps drift by ms and
+    /// upstream comparison logic can flag false changes.
+    static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
     public init(baseURL: URL = URL(string: "http://localhost:4001")!, apiToken: String? = nil) {
         self.baseURL = baseURL
         self.apiToken = apiToken
@@ -22,7 +31,7 @@ public actor APIClient: APIClientProtocol {
     public func fetchAllTasks(updatedSince: Date? = nil) async throws -> [ServerTask] {
         var components = URLComponents(url: baseURL.appendingPathComponent("api/tasks"), resolvingAgainstBaseURL: false)!
         if let updatedSince {
-            components.queryItems = [URLQueryItem(name: "updatedSince", value: ISO8601DateFormatter().string(from: updatedSince))]
+            components.queryItems = [URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince))]
         }
         let request = authorizedRequest(url: components.url!)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -38,7 +47,10 @@ public actor APIClient: APIClientProtocol {
         notes: String? = nil,
         url: String? = nil,
         priority: Int? = nil,
-        completedAt: Date? = nil
+        completedAt: Date? = nil,
+        appleReminderId: String? = nil,
+        appleReminderListId: String? = nil,
+        lastSyncedReminderModifiedAt: Date? = nil
     ) async throws -> ServerTask {
         let url_ = baseURL.appendingPathComponent("api/tasks")
         var request = authorizedRequest(url: url_)
@@ -47,14 +59,17 @@ public actor APIClient: APIClientProtocol {
 
         let body = CreateTaskRequest(
             title: title,
-            dueDate: dueDate.map { ISO8601DateFormatter().string(from: $0) },
+            dueDate: dueDate.map { Self.isoFormatter.string(from: $0) },
             listId: nil,
             listName: listName,
             listColor: listColor,
             notes: notes,
             url: url,
             priority: priority,
-            completedAt: completedAt.map { ISO8601DateFormatter().string(from: $0) }
+            completedAt: completedAt.map { Self.isoFormatter.string(from: $0) },
+            appleReminderId: appleReminderId,
+            appleReminderListId: appleReminderListId,
+            lastSyncedReminderModifiedAt: lastSyncedReminderModifiedAt.map { Self.isoFormatter.string(from: $0) }
         )
         request.httpBody = try JSONEncoder().encode(body)
 
@@ -70,7 +85,9 @@ public actor APIClient: APIClientProtocol {
         dueDate: Date? = nil,
         notes: String? = nil,
         url: String? = nil,
-        priority: Int? = nil
+        priority: Int? = nil,
+        appleReminderId: String? = nil,
+        lastSyncedReminderModifiedAt: Date? = nil
     ) async throws -> ServerTask {
         let url_ = baseURL.appendingPathComponent("api/tasks/\(id)")
         var request = authorizedRequest(url: url_)
@@ -80,10 +97,12 @@ public actor APIClient: APIClientProtocol {
         let body = UpdateTaskRequest(
             completed: completed,
             title: title,
-            dueDate: dueDate.map { ISO8601DateFormatter().string(from: $0) },
+            dueDate: dueDate.map { Self.isoFormatter.string(from: $0) },
             notes: notes,
             url: url,
-            priority: priority
+            priority: priority,
+            appleReminderId: appleReminderId,
+            lastSyncedReminderModifiedAt: lastSyncedReminderModifiedAt.map { Self.isoFormatter.string(from: $0) }
         )
         request.httpBody = try JSONEncoder().encode(body)
 
@@ -96,6 +115,62 @@ public actor APIClient: APIClientProtocol {
         let url = baseURL.appendingPathComponent("api/tasks/\(id)")
         var request = authorizedRequest(url: url)
         request.httpMethod = "DELETE"
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response)
+    }
+
+    // MARK: - Lists
+
+    public func fetchAllLists(updatedSince: Date? = nil) async throws -> [ServerList] {
+        var components = URLComponents(url: baseURL.appendingPathComponent("api/lists"), resolvingAgainstBaseURL: false)!
+        if let updatedSince {
+            components.queryItems = [URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince))]
+        }
+        let request = authorizedRequest(url: components.url!)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response)
+        return try JSONDecoder().decode([ServerList].self, from: data)
+    }
+
+    public func createList(name: String, color: String? = nil, appleReminderListId: String? = nil) async throws -> ServerList {
+        let url_ = baseURL.appendingPathComponent("api/lists")
+        var request = authorizedRequest(url: url_)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = CreateListRequest(name: name, color: color, appleReminderListId: appleReminderListId)
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response)
+        return try JSONDecoder().decode(ServerList.self, from: data)
+    }
+
+    public func updateList(id: String, name: String? = nil, color: String? = nil, appleReminderListId: String? = nil) async throws -> ServerList {
+        let url_ = baseURL.appendingPathComponent("api/lists/\(id)")
+        var request = authorizedRequest(url: url_)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = UpdateListRequest(name: name, color: color, appleReminderListId: appleReminderListId)
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response)
+        return try JSONDecoder().decode(ServerList.self, from: data)
+    }
+
+    public func deleteList(id: String, moveTo: String? = nil) async throws {
+        let url_ = baseURL.appendingPathComponent("api/lists/\(id)")
+        var request = authorizedRequest(url: url_)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let moveTo {
+            let body = ["moveTo": moveTo]
+            request.httpBody = try JSONEncoder().encode(body)
+        }
 
         let (_, response) = try await URLSession.shared.data(for: request)
         try validateResponse(response)

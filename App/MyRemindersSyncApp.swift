@@ -13,6 +13,7 @@ struct MyRemindersSyncApp: App {
         } label: {
             Image(systemName: appState.isSyncing ? "arrow.triangle.2.circlepath" : "checkmark.circle")
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -51,6 +52,13 @@ struct MenuBarView: View {
 
             Divider()
 
+            Picker("Environment", selection: $appState.environment) {
+                Text("Local").tag(ServerEnvironment.local)
+                Text("Production").tag(ServerEnvironment.production)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 250)
+
             TextField("Server URL", text: $appState.serverURL)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 250)
@@ -70,6 +78,20 @@ struct MenuBarView: View {
     }
 }
 
+enum ServerEnvironment: String {
+    case local
+    case production
+
+    /// Parse `--local` or `--production` from process arguments. Returns nil if
+    /// neither flag is present — callers fall back to the persisted preference.
+    static var fromArgs: ServerEnvironment? {
+        let args = CommandLine.arguments
+        if args.contains("--local") { return .local }
+        if args.contains("--production") { return .production }
+        return nil
+    }
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var isSyncing = false
@@ -81,24 +103,94 @@ class AppState: ObservableObject {
     @Published var launchAtLogin = false {
         didSet { updateLaunchAtLogin() }
     }
-    // Resolution order mirrors apiToken: process env → dotenv → UserDefaults →
-    // hardcoded localhost fallback. Any hit is mirrored to UserDefaults so the
-    // TextField in the menu bar reflects the active value.
+
+    // Two URLs stored separately so you can flip between them with one click.
+    // Production URL resolution: env → dotenv → UserDefaults → default vercel URL.
+    // Local URL defaults to localhost:4001 but is editable.
+    @Published var localURL: String = {
+        UserDefaults.standard.string(forKey: "localURL") ?? "http://localhost:4001"
+    }() {
+        didSet {
+            UserDefaults.standard.set(localURL, forKey: "localURL")
+            if environment == .local { serverURL = localURL }
+        }
+    }
+
+    @Published var productionURL: String = {
+        if let envURL = ProcessInfo.processInfo.environment["MAC_SYNC_PRODUCTION_URL"],
+           !envURL.isEmpty {
+            return envURL
+        }
+        let dotenv = DotEnv.load(from: DotEnv.defaultURL)
+        if let fileURL = dotenv["MAC_SYNC_PRODUCTION_URL"], !fileURL.isEmpty {
+            return fileURL
+        }
+        return UserDefaults.standard.string(forKey: "productionURL")
+            ?? "https://my-reminders.vercel.app"
+    }() {
+        didSet {
+            UserDefaults.standard.set(productionURL, forKey: "productionURL")
+            if environment == .production { serverURL = productionURL }
+        }
+    }
+
+    @Published var environment: ServerEnvironment = {
+        // `--local` / `--production` CLI flags override everything else.
+        if let fromArgs = ServerEnvironment.fromArgs {
+            return fromArgs
+        }
+        if let envURL = ProcessInfo.processInfo.environment["MAC_SYNC_SERVER_URL"],
+           envURL.contains("localhost") || envURL.contains("127.0.0.1") {
+            return .local
+        }
+        let raw = UserDefaults.standard.string(forKey: "environment") ?? "local"
+        return ServerEnvironment(rawValue: raw) ?? .local
+    }() {
+        didSet {
+            UserDefaults.standard.set(environment.rawValue, forKey: "environment")
+            serverURL = (environment == .local) ? localURL : productionURL
+        }
+    }
+
+    // Active URL — whatever the current environment points to. Derived from
+    // environment/localURL/productionURL; editing the TextField updates the
+    // URL for the currently selected environment.
     @Published var serverURL: String = {
+        // `--local` / `--production` flag: use the stored URL for that env.
+        if let fromArgs = ServerEnvironment.fromArgs {
+            if fromArgs == .local {
+                return UserDefaults.standard.string(forKey: "localURL") ?? "http://localhost:4001"
+            } else {
+                return UserDefaults.standard.string(forKey: "productionURL")
+                    ?? "https://my-reminders.vercel.app"
+            }
+        }
         if let envURL = ProcessInfo.processInfo.environment["MAC_SYNC_SERVER_URL"],
            !envURL.isEmpty {
-            UserDefaults.standard.set(envURL, forKey: "serverURL")
             return envURL
         }
         let dotenv = DotEnv.load(from: DotEnv.defaultURL)
         if let fileURL = dotenv["MAC_SYNC_SERVER_URL"], !fileURL.isEmpty {
-            UserDefaults.standard.set(fileURL, forKey: "serverURL")
             return fileURL
         }
-        return UserDefaults.standard.string(forKey: "serverURL") ?? "http://localhost:4001"
+        let envName = UserDefaults.standard.string(forKey: "environment") ?? "local"
+        if envName == "production" {
+            return UserDefaults.standard.string(forKey: "productionURL")
+                ?? "https://my-reminders.vercel.app"
+        }
+        return UserDefaults.standard.string(forKey: "localURL") ?? "http://localhost:4001"
     }() {
         didSet {
-            UserDefaults.standard.set(serverURL, forKey: "serverURL")
+            // Mirror the edit back to the per-environment URL
+            if environment == .local {
+                if serverURL != localURL {
+                    localURL = serverURL
+                }
+            } else {
+                if serverURL != productionURL {
+                    productionURL = serverURL
+                }
+            }
             recreateEngine()
         }
     }
@@ -146,14 +238,13 @@ class AppState: ObservableObject {
     }
 
     private func recreateEngine() {
-        print("[AppState] Creating engine with URL: \(serverURL)")
+        print("[AppState] Creating engine with URL: \(serverURL) (env: \(environment.rawValue))")
         let api = APIClient(
             baseURL: URL(string: serverURL) ?? URL(string: "http://localhost:4001")!,
             apiToken: apiToken.isEmpty ? nil : apiToken
         )
         let reminders = AppleRemindersService()
-        let mappingStore = MappingStore()
-        syncEngine = SyncEngine(api: api, reminders: reminders, mappingStore: mappingStore)
+        syncEngine = SyncEngine(api: api, reminders: reminders)
     }
 
     private func requestAccessAndSync() async {

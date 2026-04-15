@@ -12,24 +12,36 @@ No external dependencies — only system frameworks (EventKit, SwiftUI, ServiceM
 
 ## Architecture
 
-macOS 14+ menu bar app (SwiftUI) that does **one-way sync: Apple Reminders → Server**. Built with Swift Package Manager (swift-tools-version 5.9).
+macOS 14+ menu bar app (SwiftUI) that does **bidirectional sync: Apple Reminders ↔ Server** (tasks and lists). Built with Swift Package Manager (swift-tools-version 5.9).
 
 The package is split into three targets (see `Package.swift`):
 
-- **`SyncLib`** (`Sources/`) — library target holding all sync logic, API client, EventKit wrapper, mapping store, and models. Kept separate so it can be unit-tested without launching the app.
+- **`SyncLib`** (`Sources/`) — library target holding all sync logic, API client, EventKit wrapper, and models. Kept separate so it can be unit-tested without launching the app.
 - **`MyRemindersSync`** (`App/`) — thin executable target containing only `MyRemindersSyncApp.swift` (the SwiftUI `@main` menu bar entry point). Depends on `SyncLib`.
 - **`SyncTests`** (`Tests/SyncTests/`) — unit tests for `SyncLib`.
 
-All core services in `SyncLib` are **actors** for thread safety: `SyncEngine`, `AppleRemindersService`, `APIClient`, `MappingStore`.
+All core services in `SyncLib` are **actors** for thread safety: `SyncEngine`, `AppleRemindersService`, `APIClient`.
 
 ### Sync flow
 
-1. Fetch all Apple Reminders via EventKit (skip completed >2 months ago)
-2. For each reminder: create or update on server via REST API (`/api/tasks`)
-3. Delete from server anything removed from Apple
-4. Persist mapping state to `~/.myreminders-sync.json`
+**No local cache.** The Apple↔server identity link lives entirely on the server in two columns: `appleReminderId` on tasks and `appleReminderListId` on lists. A wiped Mac install / cleared cache **cannot duplicate data**, because the server upserts on those columns.
+
+Sync runs in two phases per cycle (lists first so tasks can be routed correctly):
+
+**Phase 0 — List sync:**
+1. `GET /api/lists` (full pull, no cursor) + `fetchAllCalendars` from EventKit (skipping read-only calendars).
+2. Apple → Server: matched by `appleReminderListId` → update if name/color changed. Unmatched but server has same name → patch the Apple ID onto the existing server list. Otherwise create a new server list with the Apple ID.
+3. Server → Apple: server lists where `appleReminderListId` is set but the EKCalendar is gone → delete on server. Server lists with no `appleReminderListId` → create the EKCalendar in Apple and patch the link back.
+
+**Phase 1 — Task sync:**
+1. `GET /api/tasks` (full pull) + `fetchAllReminders` (skipping reminders completed >2mo ago).
+2. Apple → Server: matched by `appleReminderId` → update only if `apple.lastModifiedDate > server.lastSyncedReminderModifiedAt + 1s`. If Apple unchanged but server content differs → push server → Apple, then PATCH `lastSyncedReminderModifiedAt` back to break the loop. Unmatched Apple reminders → POST to create with `appleReminderId` + `appleReminderListId`.
+3. Apple-side deletions: server task with `appleReminderId` AND `lastSyncedReminderModifiedAt != nil` (proves it was synced before) but missing from Apple's full set → soft-delete on server. **Never delete tasks that were never synced** — a missing Apple reminder might just mean this device hasn't caught up.
+4. Server-only tasks (`appleReminderId == nil`): create the EKReminder in Apple, then PATCH the server with the new `appleReminderId` + `lastSyncedReminderModifiedAt`.
 
 Sync triggers: 60-second timer, `EKEventStoreChanged` (debounced 3s), manual "Sync Now" button.
+
+EventKit does NOT expose list display order — list order is server-managed only and not synced back to Apple.
 
 ### Server: `../my-reminders`
 
@@ -53,21 +65,25 @@ EOF
 chmod 600 ~/.config/my-reminders-sync/.env
 ```
 
-- `GET /api/tasks` — list all non-deleted tasks
-- `GET /api/tasks?updatedSince=<ISO>` — incremental pull; includes soft-deleted items marked `{ deleted: true }` so this app can propagate server-side deletions into its local mapping store
-- `POST /api/tasks` — create `{ title, dueDate?, listName?, listColor?, notes?, url?, priority?, completedAt? }`
-- `PATCH /api/tasks/[id]` — update `{ completed?, title?, dueDate?, notes?, url?, priority? }`
-- `DELETE /api/tasks/[id]` — soft delete
+Tasks:
+- `GET /api/tasks` — list all non-deleted tasks. Each row includes `appleReminderId` and `lastSyncedReminderModifiedAt`.
+- `GET /api/tasks?updatedSince=<ISO>` — incremental pull (currently unused by the Mac client; full pulls are cheap and safer without a local cursor).
+- `POST /api/tasks` — create `{ title, dueDate?, listName?, listColor?, notes?, url?, priority?, completedAt?, appleReminderId?, appleReminderListId?, lastSyncedReminderModifiedAt? }`. **Idempotent on `(calendarId, appleReminderId)`** — re-posting with the same `appleReminderId` updates the existing row instead of creating a duplicate.
+- `PATCH /api/tasks/[id]` — update `{ completed?, title?, dueDate?, notes?, url?, priority?, appleReminderId?, lastSyncedReminderModifiedAt? }`.
+- `DELETE /api/tasks/[id]` — soft delete.
 
-The server stores tasks as iCalendar VTODO objects in the `CalendarObject` Prisma model. Changes made via this sync app's REST API are visible in the web UI and to any CalDAV clients connected to the same server. When modifying the API contract, both projects must be updated together.
+Lists:
+- `GET /api/lists` — list all non-deleted calendars. Each row includes `appleReminderListId`.
+- `GET /api/lists?updatedSince=<ISO>` — incremental pull.
+- `POST /api/lists` — create `{ name, color?, order?, appleReminderListId? }`. **Idempotent on `(principalId, appleReminderListId)`** — same Apple ID → returns existing row.
+- `PATCH /api/lists/[id]` — update `{ name?, color?, order?, appleReminderListId? }`.
+- `DELETE /api/lists/[id]` — soft delete with optional `{ moveTo?: string }` body to migrate tasks.
 
-### State file
-
-`~/.myreminders-sync.json` stores `lastSync` timestamp and `mappings` (Apple calendarItemIdentifier → `SyncItemState`, which carries the server task ID plus the last-synced Apple mod date and server `updatedAt`). No local database. The decoder in `Models.swift` still accepts the legacy `[String: String]` mapping format for backward compatibility.
+The server stores tasks as iCalendar VTODO objects in the `CalendarObject` Prisma model. Apple identity columns: `apple_reminder_id` + `last_synced_reminder_modified_at` on `calendar_objects`, `apple_reminder_list_id` on `calendars` — all with partial unique indexes so multiple NULLs (web-UI–only rows) coexist. Changes made via this sync app's REST API are visible in the web UI. When modifying the API contract, both projects must be updated together.
 
 ### Key implementation details
 
 - EventKit notifications are suppressed during sync + 5s after to prevent re-trigger loops
 - 50ms delay between API calls to avoid overwhelming the server
-- State is saved periodically during sync (every 50 items) to survive crashes
 - Server URL is configurable via menu bar UI and persisted in UserDefaults
+- Conflict resolution on tasks: Apple wins when its `lastModifiedDate` advances past the stored `lastSyncedReminderModifiedAt`; otherwise server wins via content comparison. After a server→Apple update, the engine PATCHes `lastSyncedReminderModifiedAt` back to break the natural ping-pong loop.

@@ -10,7 +10,10 @@ public protocol APIClientProtocol: Sendable {
         notes: String?,
         url: String?,
         priority: Int?,
-        completedAt: Date?
+        completedAt: Date?,
+        appleReminderId: String?,
+        appleReminderListId: String?,
+        lastSyncedReminderModifiedAt: Date?
     ) async throws -> ServerTask
     func updateTask(
         id: String,
@@ -19,9 +22,17 @@ public protocol APIClientProtocol: Sendable {
         dueDate: Date?,
         notes: String?,
         url: String?,
-        priority: Int?
+        priority: Int?,
+        appleReminderId: String?,
+        lastSyncedReminderModifiedAt: Date?
     ) async throws -> ServerTask
     func deleteTask(id: String) async throws
+
+    // List CRUD
+    func fetchAllLists(updatedSince: Date?) async throws -> [ServerList]
+    func createList(name: String, color: String?, appleReminderListId: String?) async throws -> ServerList
+    func updateList(id: String, name: String?, color: String?, appleReminderListId: String?) async throws -> ServerList
+    func deleteList(id: String, moveTo: String?) async throws
 }
 
 public protocol RemindersServiceProtocol: Sendable {
@@ -47,11 +58,33 @@ public protocol RemindersServiceProtocol: Sendable {
     ) async throws
     func deleteReminder(id: String) async throws
     func reminder(withId id: String) async -> ReminderItem?
+
+    // Calendar (list) CRUD
+    func fetchAllCalendars() async throws -> [CalendarItem]
+    func createCalendar(name: String, color: String?) async throws -> CalendarItem
+    func renameCalendar(id: String, name: String) async throws
+    func setCalendarColor(id: String, color: String) async throws
+    func deleteCalendar(id: String) async throws
 }
 
-public protocol MappingStoreProtocol: Sendable {
-    func load() async throws -> SyncState
-    func save(_ state: SyncState) async throws
+/// Protocol-friendly value type representing an Apple Reminder list (EKCalendar)
+public struct CalendarItem: Sendable {
+    public let calendarIdentifier: String
+    public let title: String
+    public let color: String?
+    public let allowsContentModifications: Bool
+
+    public init(
+        calendarIdentifier: String,
+        title: String,
+        color: String? = nil,
+        allowsContentModifications: Bool = true
+    ) {
+        self.calendarIdentifier = calendarIdentifier
+        self.title = title
+        self.color = color
+        self.allowsContentModifications = allowsContentModifications
+    }
 }
 
 /// Protocol-friendly value type representing an Apple Reminder
@@ -67,6 +100,10 @@ public struct ReminderItem: Sendable {
     public let priority: Int
     public let listName: String
     public let listColor: String?
+    /// EKCalendar.calendarIdentifier of the list this reminder belongs to.
+    /// Mac sync passes it as `appleReminderListId` so the server can route the
+    /// task into the right list independent of names.
+    public let listCalendarIdentifier: String
 
     public init(
         calendarItemIdentifier: String,
@@ -79,7 +116,8 @@ public struct ReminderItem: Sendable {
         url: URL? = nil,
         priority: Int = 0,
         listName: String = "Reminders",
-        listColor: String? = nil
+        listColor: String? = nil,
+        listCalendarIdentifier: String = ""
     ) {
         self.calendarItemIdentifier = calendarItemIdentifier
         self.title = title
@@ -92,5 +130,6 @@ public struct ReminderItem: Sendable {
         self.priority = priority
         self.listName = listName
         self.listColor = listColor
+        self.listCalendarIdentifier = listCalendarIdentifier
     }
 }
