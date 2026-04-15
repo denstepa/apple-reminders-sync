@@ -28,10 +28,17 @@ public actor APIClient: APIClientProtocol {
         return request
     }
 
-    public func fetchAllTasks(updatedSince: Date? = nil) async throws -> [ServerTask] {
+    public func fetchAllTasks(updatedSince: Date? = nil, includeDeleted: Bool = false) async throws -> [ServerTask] {
         var components = URLComponents(url: baseURL.appendingPathComponent("api/tasks"), resolvingAgainstBaseURL: false)!
+        var queryItems: [URLQueryItem] = []
         if let updatedSince {
-            components.queryItems = [URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince))]
+            queryItems.append(URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince)))
+        }
+        if includeDeleted {
+            queryItems.append(URLQueryItem(name: "includeDeleted", value: "true"))
+        }
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
         }
         let request = authorizedRequest(url: components.url!)
         let (data, response) = try await URLSession.shared.data(for: request)

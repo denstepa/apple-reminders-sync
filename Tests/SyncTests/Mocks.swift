@@ -27,10 +27,15 @@ actor MockAPIClient: APIClientProtocol {
 
     // MARK: Tasks
 
-    func fetchAllTasks(updatedSince: Date?) async throws -> [ServerTask] {
+    func fetchAllTasks(updatedSince: Date?, includeDeleted: Bool) async throws -> [ServerTask] {
         fetchTaskCalls.append(updatedSince)
-        guard let updatedSince else { return Array(tasks.values) }
-        return tasks.values.filter { $0.updatedAtParsed > updatedSince }
+        if let updatedSince {
+            return tasks.values.filter { $0.updatedAtParsed > updatedSince }
+        }
+        if includeDeleted {
+            return Array(tasks.values)
+        }
+        return tasks.values.filter { !$0.isDeleted }
     }
 
     func createTask(
@@ -46,9 +51,13 @@ actor MockAPIClient: APIClientProtocol {
         appleReminderListId: String?,
         lastSyncedReminderModifiedAt: Date?
     ) async throws -> ServerTask {
-        // Simulate server upsert-on-appleReminderId.
+        // Simulate server upsert-on-appleReminderId. A matching tombstone is
+        // returned as-is (server owns the deletion, no resurrection).
         if let appleId = appleReminderId,
            let existing = tasks.values.first(where: { $0.appleReminderId == appleId }) {
+            if existing.isDeleted {
+                return existing
+            }
             return try await self.updateTask(
                 id: existing.id,
                 completed: completedAt != nil,

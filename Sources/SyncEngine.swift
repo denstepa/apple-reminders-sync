@@ -163,9 +163,11 @@ public actor SyncEngine {
         cursor: Date,
         progress: @Sendable @MainActor (SyncProgress) -> Void
     ) async throws {
-        // Fetch ALL server tasks — needed for Apple-side deletion detection
-        // (we must see every linked server task, not just recently-changed ones).
-        let serverTasks = try await api.fetchAllTasks(updatedSince: nil)
+        // Fetch ALL server tasks INCLUDING tombstones — tombstones carry the
+        // `appleReminderId` of items the user deleted on the server, so we can
+        // propagate those deletions to Apple and avoid resurrecting them via
+        // upsert-by-apple-id.
+        let serverTasks = try await api.fetchAllTasks(updatedSince: nil, includeDeleted: true)
 
         let allReminders = try await reminders.fetchAllReminders()
         // Filter out reminders completed > 2 months ago — they're noise.
@@ -266,9 +268,18 @@ public actor SyncEngine {
                     appleReminderListId: apple.listCalendarIdentifier.isEmpty ? nil : apple.listCalendarIdentifier,
                     lastSyncedReminderModifiedAt: apple.lastModifiedDate
                 )
-                serverByAppleId[apple.calendarItemIdentifier] = created
-                result.createdOnServer += 1
-                logger.log("Created on server: \(apple.title)")
+                if created.isDeleted {
+                    // Server returned a tombstone: it owns this deletion (user
+                    // removed the task in the web UI between our fetch and POST,
+                    // or the fetch somehow missed the tombstone). Honor it.
+                    try await reminders.deleteReminder(id: apple.calendarItemIdentifier)
+                    result.deletedOnApple += 1
+                    logger.log("Deleted in Apple (server tombstone on POST): \(apple.title)")
+                } else {
+                    serverByAppleId[apple.calendarItemIdentifier] = created
+                    result.createdOnServer += 1
+                    logger.log("Created on server: \(apple.title)")
+                }
                 didWork = true
             }
 

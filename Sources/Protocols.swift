@@ -1,7 +1,7 @@
 import Foundation
 
 public protocol APIClientProtocol: Sendable {
-    func fetchAllTasks(updatedSince: Date?) async throws -> [ServerTask]
+    func fetchAllTasks(updatedSince: Date?, includeDeleted: Bool) async throws -> [ServerTask]
     func createTask(
         title: String,
         dueDate: Date?,
