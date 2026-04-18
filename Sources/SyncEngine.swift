@@ -51,18 +51,49 @@ public actor SyncEngine {
         await progress(SyncProgress(phase: "Syncing lists", current: 0, total: 0, skipped: 0))
 
         // Always pull all lists — they're few and we can't trust a local cursor.
-        let serverLists = try await api.fetchAllLists(updatedSince: nil)
-        let appleCalendars = try await reminders.fetchAllCalendars()
+        // Fetch tombstones too: when the user deleted a list via the web UI, we
+        // need to see the tombstone so we can delete the matching EKCalendar in
+        // Apple and not POST a resurrecting create.
+        let serverLists = try await api.fetchAllLists(updatedSince: nil, includeDeleted: true)
+        var appleCalendars = try await reminders.fetchAllCalendars()
             .filter { $0.allowsContentModifications }
 
         var serverByAppleId: [String: ServerList] = [:]
         var unlinkedServerByName: [String: ServerList] = [:]
-        for list in serverLists where !list.isDeleted {
+        var tombstonedAppleIds: [String: ServerList] = [:]
+        for list in serverLists {
+            if list.isDeleted {
+                if let appleId = list.appleReminderListId {
+                    tombstonedAppleIds[appleId] = list
+                }
+                continue
+            }
             if let appleId = list.appleReminderListId {
                 serverByAppleId[appleId] = list
             } else {
                 unlinkedServerByName[list.name] = list
             }
+        }
+
+        // Phase A: propagate server-side deletions to Apple BEFORE the
+        // Apple→Server loop, so we don't POST a create for an Apple list whose
+        // server tombstone we already know about (which would just plant a
+        // fresh tombstone and leave Apple untouched).
+        var deletedFromApple = Set<String>()
+        for apple in appleCalendars {
+            guard let tombstone = tombstonedAppleIds[apple.calendarIdentifier] else { continue }
+            do {
+                try await reminders.deleteCalendar(id: apple.calendarIdentifier)
+                deletedFromApple.insert(apple.calendarIdentifier)
+                result.listsDeletedOnApple += 1
+                logger.log("Deleted list in Apple (server tombstone): \(tombstone.name)")
+            } catch {
+                logger.log("Failed to delete list in Apple: \(error)")
+            }
+            try? await Task.sleep(for: requestDelay)
+        }
+        if !deletedFromApple.isEmpty {
+            appleCalendars.removeAll { deletedFromApple.contains($0.calendarIdentifier) }
         }
 
         var handledServerIds = Set<String>()
@@ -101,9 +132,22 @@ public actor SyncEngine {
                     color: apple.color,
                     appleReminderListId: apple.calendarIdentifier
                 )
-                handledServerIds.insert(created.id)
-                result.listsCreatedOnServer += 1
-                logger.log("Created list on server: \(apple.title)")
+                if created.isDeleted {
+                    // Server owns this deletion — race between our Phase A and
+                    // a fresh web-UI delete, or a tombstone we didn't pick up.
+                    // Honor it.
+                    do {
+                        try await reminders.deleteCalendar(id: apple.calendarIdentifier)
+                        result.listsDeletedOnApple += 1
+                        logger.log("Deleted list in Apple (server tombstone on POST): \(apple.title)")
+                    } catch {
+                        logger.log("Failed to delete list in Apple after tombstone POST: \(error)")
+                    }
+                } else {
+                    handledServerIds.insert(created.id)
+                    result.listsCreatedOnServer += 1
+                    logger.log("Created list on server: \(apple.title)")
+                }
             }
             try? await Task.sleep(for: requestDelay)
         }

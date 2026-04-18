@@ -144,9 +144,13 @@ actor MockAPIClient: APIClientProtocol {
 
     // MARK: Lists
 
-    func fetchAllLists(updatedSince: Date?) async throws -> [ServerList] {
+    func fetchAllLists(updatedSince: Date?, includeDeleted: Bool) async throws -> [ServerList] {
         fetchListCalls.append(updatedSince)
-        return Array(lists.values)
+        let all = Array(lists.values)
+        if includeDeleted || updatedSince != nil {
+            return all
+        }
+        return all.filter { !$0.isDeleted }
     }
 
     func createList(name: String, color: String?, appleReminderListId: String?) async throws -> ServerList {

@@ -129,10 +129,17 @@ public actor APIClient: APIClientProtocol {
 
     // MARK: - Lists
 
-    public func fetchAllLists(updatedSince: Date? = nil) async throws -> [ServerList] {
+    public func fetchAllLists(updatedSince: Date? = nil, includeDeleted: Bool = false) async throws -> [ServerList] {
         var components = URLComponents(url: baseURL.appendingPathComponent("api/lists"), resolvingAgainstBaseURL: false)!
+        var queryItems: [URLQueryItem] = []
         if let updatedSince {
-            components.queryItems = [URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince))]
+            queryItems.append(URLQueryItem(name: "updatedSince", value: Self.isoFormatter.string(from: updatedSince)))
+        }
+        if includeDeleted {
+            queryItems.append(URLQueryItem(name: "includeDeleted", value: "true"))
+        }
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
         }
         let request = authorizedRequest(url: components.url!)
         let (data, response) = try await URLSession.shared.data(for: request)

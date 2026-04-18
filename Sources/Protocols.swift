@@ -29,7 +29,7 @@ public protocol APIClientProtocol: Sendable {
     func deleteTask(id: String) async throws
 
     // List CRUD
-    func fetchAllLists(updatedSince: Date?) async throws -> [ServerList]
+    func fetchAllLists(updatedSince: Date?, includeDeleted: Bool) async throws -> [ServerList]
     func createList(name: String, color: String?, appleReminderListId: String?) async throws -> ServerList
     func updateList(id: String, name: String?, color: String?, appleReminderListId: String?) async throws -> ServerList
     func deleteList(id: String, moveTo: String?) async throws
